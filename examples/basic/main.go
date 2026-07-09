@@ -1,15 +1,15 @@
-// Command basic is the smallest golib example: build a value through the
+// Command basic is the smallest libraft example: build a value through the
 // generic builder and print the result.
 package main
 
 import (
 	"fmt"
 
-	"github.com/cnuss/golib"
+	"github.com/cnuss/libraft"
 )
 
 func main() {
-	res := golib.New[string]().
+	res := libraft.New[string]().
 		WithName("greeting").
 		WithValue("hello world").
 		Build()
