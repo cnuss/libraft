@@ -10,12 +10,14 @@ Deep-link by filename; line numbers will drift.
 
 | Topic                                          | Source                                                           |
 | ---------------------------------------------- | ---------------------------------------------------------------- |
-| Façade (`New`)                                 | [`lib.go`](./lib.go)                                             |
-| Stable interface (`Builder[T]` + `Result[T]`)  | [`v1/v1.go`](./v1/v1.go)                                         |
-| Implementation struct + `New[T]` constructor   | [`v1alpha1/v1alpha1.go`](./v1alpha1/v1alpha1.go)                 |
-| Builder methods (`WithName`, `WithValue`, …)   | [`v1alpha1/builder.go`](./v1alpha1/builder.go)                   |
-| Unit tests + fuzz target                       | [`v1alpha1/builder_test.go`](./v1alpha1/builder_test.go)         |
-| godoc examples                                 | [`v1/example_test.go`](./v1/example_test.go)                     |
+| Port state + monkey-patch mechanism            | [`v3/DEVNOTES.md`](./v3/DEVNOTES.md)                             |
+| Behavioral limits + force-new-cluster          | [`v3/LIMITATIONS.md`](./v3/LIMITATIONS.md)                       |
+| Installer (`init`, `s3StartNode`, `patchFunc`) | [`v3/reflect/init.go`](./v3/reflect/init.go)                     |
+| Platform patch primitives                      | [`v3/reflect/init_darwin.go`](./v3/reflect/init_darwin.go), [`init_windows.go`](./v3/reflect/init_windows.go), [`init_other.go`](./v3/reflect/init_other.go) |
+| S3 CAS client                                  | [`v3/client.go`](./v3/client.go)                                 |
+| raft.Node over the S3 log + `Start`            | [`v3/node.go`](./v3/node.go)                                     |
+| `S3OpenBackend`, checkpoint/restore, guards    | [`v3/checkpoint.go`](./v3/checkpoint.go)                         |
+| Core unit tests                                | [`v3/cas_linearizability_test.go`](./v3/cas_linearizability_test.go) |
 | e2e harness + runner                           | [`e2e/e2e_test.go`](./e2e/e2e_test.go)                           |
 | Worked examples                                | [`examples/`](./examples)                                        |
 | Build / lint / test commands                   | [`Makefile`](./Makefile)                                         |
@@ -28,23 +30,26 @@ Deep-link by filename; line numbers will drift.
 
 ## Module layout
 
-Three packages, stable/alpha versioning:
+Two packages:
 
 ```
-github.com/cnuss/libraft           — root façade. Stable surface (New).
-github.com/cnuss/libraft/v1        — stable Builder[T] interface + Result[T].
-github.com/cnuss/libraft/v1alpha1  — current implementation. May change
-                                   between alpha revisions.
+github.com/cnuss/libraft/v3          — s3raft core: S3 CAS log, raft.Node over
+                                     the log, bbolt checkpoint/restore, notify,
+                                     batch, metrics.
+github.com/cnuss/libraft/v3/reflect  — the installer: blank-import to monkey-patch
+                                     etcd's raft entry points into the core.
 ```
 
-Application code imports the root (`libraft.New[T]()…`). Code that needs to
-declare types against the interface imports `v1`. Direct access to the
-`BuilderImpl[T]` struct lives in `v1alpha1`. The current `Builder[T]` API is a
-generic starting point — swap it for the real one, keeping the layering.
+A host blank-imports `v3/reflect`; its `init` (when `ETCD_S3LOG_URL` is set)
+rewrites the prologue of `raft.StartNode`, `raft.RestartNode` and
+`serverstorage.OpenBackend` to jump into the core. The core exports the seam
+the installer calls: `Start`, `S3OpenBackend`, `ActiveNS`, `EnvURL`, `Logger`.
+The monkey-patch is intentional and load-bearing — see
+[`v3/DEVNOTES.md`](./v3/DEVNOTES.md); never replace it with a source edit.
 
 ## Local development
 
-Requires Go 1.21 or later.
+Requires Go 1.26 or later (pinned by `go.etcd.io/etcd/server/v3`).
 
 ```sh
 git clone https://github.com/cnuss/libraft.git
@@ -57,7 +62,6 @@ Run a specific example locally:
 
 ```sh
 make run basic
-make run named
 ```
 
 ## Test layout
@@ -65,8 +69,8 @@ make run named
 Three tiers, each with a distinct job — don't blur them:
 
 - **`*_test.go` next to the code** — unit tests: anything with fabricated
-  inputs or fakes, however elaborate. Includes fuzz targets and the godoc
-  examples in [`v1/example_test.go`](./v1/example_test.go).
+  inputs or fakes, however elaborate (e.g. the CAS linearizability and SQS
+  notify tests in [`v3/`](./v3)).
 - **`examples/`** — real-world, simple-ish API usage written for humans. An
   example demonstrates; it never asserts. Assertion logic belongs in `e2e/`.
 - **`e2e/`** — the harness builds and runs the example binaries and asserts
@@ -89,10 +93,16 @@ Easy to get wrong from the diff alone:
 - **`examples/` is intentionally duplicated.** Each `main.go` is a
   copy-pasteable starter; no shared internal package. Don't refactor it into
   one.
-- **godoc example funcs can't bind to generic types.** `go vet` rejects
-  `ExampleBuilder_*` in `v1` because `Builder` is parameterized — its example
-  checker hasn't caught up with generics. Work around it with package-level
-  example names (`Example_value` etc.). See [`v1/example_test.go`](./v1/example_test.go).
+- **`go vet` runs with `-unsafeptr=false`.** The installer converts a
+  text-segment code address (`uintptr`) to `unsafe.Pointer` to overwrite a
+  function prologue — a legitimate monkey-patch that `vet`'s `unsafeptr`
+  analyzer flags as misuse. The Makefile's `vet` and `windows` targets disable
+  that one analyzer; keep it off, don't rewrite the patcher to appease it (the
+  mechanism is load-bearing — see [`v3/DEVNOTES.md`](./v3/DEVNOTES.md)).
+- **The patcher is platform- and arch-specific.** `//go:build` tags partition
+  `init_darwin.go` (mach_vm_protect) / `init_windows.go` (VirtualProtect) /
+  `init_other.go` (mprotect); amd64 + arm64. Adding a platform means adding a
+  primitives file, not editing the shared `init.go`.
 - **e2e builds binaries at runtime**, so the test cache can't see example
   source changes — `make e2e` passes `-count=1` to force a rebuild.
 - **Skip-release token must be line-anchored.** The regex in
@@ -140,14 +150,14 @@ etc.
 ## Pull requests
 
 - Keep PRs focused. One feature or fix per PR.
-- Include test coverage for behavior changes — lib tests (`v1alpha1/`) for API
-  changes, e2e tests (`e2e/e2e_test.go`) for example-visible changes.
-- **Keep the README in sync with the façade.** The README mirrors the public
+- Include test coverage for behavior changes — core tests (`v3/`) for the S3
+  log / node behavior, e2e tests (`e2e/e2e_test.go`) for example-visible changes.
+- **Keep the README in sync with the seam.** The README mirrors the public
   surface, so any change to it must update the README in the same PR:
-  - a new/changed/removed method on `Builder[T]` (or the `v1` surface) → update
-    the **API at a glance** block and the **Quick Start** snippet;
-  - a new example → add a row to the **Examples** table;
-  - a renamed package/version tier → update the **Layout** tree.
+  - a new/changed/removed exported core symbol or patched target → update the
+    **The install seam** section and the **Quick Start** snippet;
+  - a new example → add a row to the **Example** table;
+  - a renamed package → update the **Layout** tree.
   Treat the README's code blocks as documentation that must compile against the
   current API — stale snippets are a review blocker.
 - Signed commits preferred. The repo enables commit signing locally; CI does

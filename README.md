@@ -7,91 +7,94 @@
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cnuss/libraft/badge)](https://scorecard.dev/viewer/?uri=github.com/cnuss/libraft)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
-`libraft` is a thin, stable façade over stable/alpha versioned packages
-(`v1` stable contract, `v1alpha1` mutable implementation), with CI, CodeQL,
-OpenSSF Scorecard, cosign-signed releases, Dependabot, examples, and an e2e
+`libraft` (**s3raft**) replaces etcd's raft consensus with an
+**S3-compatible object store**. S3 conditional writes (`If-None-Match` / CAS)
+build a shared, totally-ordered append log — and that log *is* the raft log.
+Every node runs its own etcd apply loop over the same log, so anything computed
+at apply time (revision, consistent index, auth state) is a deterministic
+function of the log and stays identical across nodes. Ships with CI, CodeQL,
+OpenSSF Scorecard, cosign-signed releases, Dependabot, an example, and an e2e
 harness.
 
-The API is a generic builder: `New[T]()` configures with `With*` methods and
-finalizes with `Build()`.
+It installs into etcd by machine-code monkey-patch — **no edits to etcd
+source** — triggered by a blank import plus the `ETCD_S3LOG_URL` environment
+variable. See [`v3/DEVNOTES.md`](./v3/DEVNOTES.md) for the mechanism and
+[`v3/LIMITATIONS.md`](./v3/LIMITATIONS.md) for the behavioral edges.
 
 ## Quick Start
 
 ```sh
-go get github.com/cnuss/libraft
+go get github.com/cnuss/libraft/v3
 ```
+
+Blank-import the installer in the etcd binary's `main`; it patches
+`raft.StartNode`, `raft.RestartNode` and `serverstorage.OpenBackend` at `init`
+when `ETCD_S3LOG_URL` is set (a no-op otherwise):
 
 ```go
 package main
 
 import (
-	"fmt"
-
-	"github.com/cnuss/libraft"
+	_ "github.com/cnuss/libraft/v3/reflect"
 )
 
-func main() {
-	res := libraft.New[string]().
-		WithName("greeting").
-		WithValue("hello world").
-		Build()
-
-	fmt.Printf("%s: %s\n", res.Name, res.Value) // greeting: hello world
-}
+// ... build/run etcd as usual ...
 ```
 
-(Full source: [`examples/basic/main.go`](./examples/basic/main.go).)
+```sh
+export ETCD_S3LOG_URL=s3://my-bucket/my-prefix   # bucket name must be lowercase
+export AWS_ACCESS_KEY_ID=…  AWS_SECRET_ACCESS_KEY=…
+etcd --data-dir /var/lib/etcd
+```
+
+(Minimal install call site: [`examples/basic/main.go`](./examples/basic/main.go).)
 
 ## Layout
 
-Three packages, stable/alpha versioning:
+Two packages:
 
 ```
-github.com/cnuss/libraft           — root façade. Stable surface (New).
-github.com/cnuss/libraft/v1        — stable Builder[T] interface + Result[T].
-github.com/cnuss/libraft/v1alpha1  — current implementation. May change
-                                   between alpha revisions.
+github.com/cnuss/libraft/v3          — s3raft core: S3 CAS log, raft.Node over
+                                     the log, bbolt checkpoint/restore, notify,
+                                     batch, metrics.
+github.com/cnuss/libraft/v3/reflect  — the installer: blank-import to monkey-patch
+                                     etcd's raft entry points into the core.
 ```
 
-Application code imports the root (`libraft.New[T]()…`). Code that needs to
-declare types against the interface imports `v1`. Direct access to the
-`BuilderImpl[T]` struct lives in `v1alpha1`.
-
-For the file-by-file map, see
+Hosts blank-import `v3/reflect`; the core exports the seam it calls
+(`Start`, `S3OpenBackend`, `ActiveNS`, `EnvURL`, `Logger`). For the
+file-by-file map, see
 [CONTRIBUTING.md → Where to find things](./CONTRIBUTING.md#where-to-find-things).
 
-## API at a glance
+## The install seam
 
-```go
-type Builder[T any] interface {
-    WithName(name string) Builder[T]   // display name carried into the Result
-    WithValue(v T) Builder[T]          // the payload Build produces
-    Build() Result[T]                  // terminal: assembles and returns
-    Name() string                      // configured name (empty if unset)
-}
+The installer rewrites the machine-code prologue of three exported functions
+with an unconditional jump into the core:
 
-type Result[T any] struct {
-    Name  string `json:"name,omitempty"`
-    Value T      `json:"value"`
-}
+| Patched target              | Replacement                    |
+| --------------------------- | ------------------------------ |
+| `raft.StartNode`            | `s3StartNode` → `v3.Start`     |
+| `raft.RestartNode`          | `s3RestartNode` → `v3.Start`   |
+| `serverstorage.OpenBackend` | `v3.S3OpenBackend`             |
 
-func New[T any]() Builder[T]   // unconfigured builder
-```
+Only exported far-module entry points are patched (never etcd's unexported
+`newRaftNode`), so the replacements are expressible with exported types alone
+and never collide with the patcher's own text pages. Platform primitives:
+`mach_vm_protect` on darwin, `mprotect` on linux, `VirtualProtect` on windows;
+amd64 and arm64.
 
-## Examples
+## Example
 
-Self-contained programs in [`./examples`](./examples):
+Self-contained program in [`./examples`](./examples):
 
-| Example | Demonstrates                                          |
-| ------- | ----------------------------------------------------- |
-| `basic` | Smallest wiring — `New` + `WithValue` + `Build`.      |
-| `named` | A typed struct payload carried through `WithValue`.   |
+| Example | Demonstrates                                                |
+| ------- | ---------------------------------------------------------- |
+| `basic` | Blank-import the installer; print the activation env var.  |
 
-Run one locally:
+Run it locally:
 
 ```sh
 make run basic
-make run named
 ```
 
 ## Testing
