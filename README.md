@@ -62,13 +62,14 @@ For the file-by-file map, see
 
 ```go
 type Builder interface {
-    Build() raft.Node   // terminal: assembles and returns the node
+    WithLog(logger *slog.Logger) Builder   // logger the node logs through
+    Build() raft.Node                      // terminal: assembles and returns the node
 }
 
 func New() Builder   // unconfigured builder
 ```
 
-Configuration (`With*` methods) and node assembly land in upcoming revisions;
+Node assembly (and further `With*` configuration) lands in upcoming revisions;
 until then `Build()` returns nil.
 
 ## Examples
