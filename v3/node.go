@@ -17,6 +17,7 @@ package v3
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -624,7 +625,7 @@ func (n *node) publishLocalEntries(ms *raft.MemoryStorage, from, to uint64) erro
 			return fmt.Errorf("seed head at %d: %w", from-1, err)
 		}
 	}
-	ents, err := ms.Entries(from, to+1, ^uint64(0))
+	ents, err := ms.Entries(from, to+1, math.MaxUint64)
 	if err != nil {
 		return fmt.Errorf("read local entries [%d,%d]: %w", from, to, err)
 	}

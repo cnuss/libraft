@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -550,7 +551,7 @@ func (n *node) truncationFloor(cli *client) uint64 {
 	if err != nil || len(keys) == 0 {
 		return 0
 	}
-	min := ^uint64(0)
+	min := uint64(math.MaxUint64)
 	for _, k := range keys {
 		raw, gerr := cli.get(k)
 		if gerr != nil {
@@ -564,7 +565,7 @@ func (n *node) truncationFloor(cli *client) uint64 {
 			min = p.SnapshotIndex
 		}
 	}
-	if min == ^uint64(0) {
+	if min == math.MaxUint64 {
 		return 0
 	}
 	return min

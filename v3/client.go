@@ -299,13 +299,9 @@ func (c *client) appendCAS(firstIdx, lastIdx uint64, body []byte) error {
 		}
 	}
 
-	raw, etag, err := c.getWithETag(headKey)
+	h, etag, err := c.loadHead()
 	if err != nil {
 		return err
-	}
-	var h head
-	if err := json.Unmarshal(raw, &h); err != nil {
-		return fmt.Errorf("s3raft: corrupt HEAD object: %w", err)
 	}
 	if h.Index >= firstIdx {
 		return errConflict // someone already claimed our range
@@ -330,34 +326,37 @@ func (c *client) appendCAS(firstIdx, lastIdx uint64, body []byte) error {
 	return c.put(logKey(lastIdx), body)
 }
 
+// loadHead reads and decodes the HEAD pointer, returning its ETag so callers
+// that CAS on it (appendCAS, seedHead) can pass the ETag to putIfMatch.
+func (c *client) loadHead() (head, string, error) {
+	var h head
+	raw, etag, err := c.getWithETag(headKey)
+	if err != nil {
+		return h, "", err
+	}
+	if err := json.Unmarshal(raw, &h); err != nil {
+		return h, "", fmt.Errorf("s3raft: corrupt HEAD object: %w", err)
+	}
+	return h, etag, nil
+}
+
 // readHead returns the current HEAD pointer (etagChain mode). HEAD is the
 // authoritative commit point: a batch is linearizably committed the instant its
 // If-Match CAS advances HEAD, which happens before the per-index log object is
 // published. Readers must consult HEAD (not just log/ objects) to observe the
 // true committed index.
 func (c *client) readHead() (head, error) {
-	var h head
-	raw, _, err := c.getWithETag(headKey)
-	if err != nil {
-		return h, err
-	}
-	if err := json.Unmarshal(raw, &h); err != nil {
-		return h, fmt.Errorf("s3raft: corrupt HEAD object: %w", err)
-	}
-	return h, nil
+	h, _, err := c.loadHead()
+	return h, err
 }
 
 // seedHead advances the HEAD pointer to index (etagChain mode) when the log is
 // being bootstrapped from restored local state — see node.seedLogFromLocal.
 // No-op if HEAD already reached index (a peer seeded concurrently).
 func (c *client) seedHead(index uint64) error {
-	raw, etag, err := c.getWithETag(headKey)
+	h, etag, err := c.loadHead()
 	if err != nil {
 		return err
-	}
-	var h head
-	if err := json.Unmarshal(raw, &h); err != nil {
-		return fmt.Errorf("s3raft: corrupt HEAD object: %w", err)
 	}
 	if h.Index >= index {
 		return nil
