@@ -144,19 +144,26 @@ func (p *PushNotifier) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	wake := p.wake
 	p.mu.Unlock()
 
+	if s3EventCreatesLogObject(ev) && wake != nil {
+		wake()
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// s3EventCreatesLogObject reports whether any record in an S3 event notification
+// creates a log object. The push and SQS notifiers share it so they agree on
+// what counts as a log key (see isLogKey).
+func s3EventCreatesLogObject(ev s3Event) bool {
 	for _, rec := range ev.Records {
 		key := rec.S3.Object.Key
 		if dec, derr := url.QueryUnescape(key); derr == nil {
-			key = dec
+			key = dec // S3 notification keys are URL-encoded
 		}
-		if strings.Contains(key, "/log/") {
-			if wake != nil {
-				wake()
-			}
-			break
+		if isLogKey(key) {
+			return true
 		}
 	}
-	w.WriteHeader(http.StatusOK)
+	return false
 }
 
 // s3Event is the subset of an S3 event notification record we consume.

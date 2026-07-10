@@ -172,6 +172,73 @@ func parseLogKey(key string) (uint64, bool) {
 	return n, true
 }
 
+// isLogKey reports whether an object key (namespaced or bare) names a log
+// object — i.e. its last "log/" segment is followed by a numeric index. It is
+// the single predicate the notifiers use, deferring the numeric check to
+// parseLogKey instead of matching "/log/" as a loose substring.
+func isLogKey(key string) bool {
+	if i := strings.LastIndex(key, "log/"); i >= 0 {
+		key = key[i:]
+	}
+	_, ok := parseLogKey(key)
+	return ok
+}
+
+// seedGenesis bootstraps a fresh cluster (peers = --initial-cluster-state=new):
+// it CAS-writes the initial ConfChange entries into the empty log and sets this
+// node's initial leadership, before Start's replay reads the entries back.
+// Deterministic leadership: the lowest member id is the epoch owner and the
+// other founders boot as its followers, avoiding a boot-order race where every
+// founder claims the epoch and then fences down to the winner (a settle window
+// that surfaces transient "leader changed" errors on a high-latency store).
+func (n *node) seedGenesis(peers []raft.Peer) error {
+	designated := n.id
+	for _, p := range peers {
+		if p.ID < designated {
+			designated = p.ID
+		}
+	}
+
+	// Seed the initial ConfChange entries. Idempotent: an existing log wins the
+	// CAS and is adopted by the replay in Start. Stamped with the genesis epoch
+	// so every founder writes identical entries regardless of which leads or
+	// wins each index.
+	for i, p := range peers {
+		cc := &raftpb.ConfChange{
+			Type:    raftpb.ConfChangeAddNode.Enum(),
+			NodeId:  proto.Uint64(p.ID),
+			Context: p.Context,
+		}
+		data, merr := proto.Marshal(cc)
+		if merr != nil {
+			return merr
+		}
+		ent := &raftpb.Entry{
+			Term:  proto.Uint64(genesisEpoch),
+			Index: proto.Uint64(uint64(i + 1)),
+			Type:  raftpb.EntryConfChange.Enum(),
+			Data:  data,
+		}
+		body, merr := encodeEntries([]*raftpb.Entry{ent})
+		if merr != nil {
+			return merr
+		}
+		if perr := n.cli.appendCAS(uint64(i+1), uint64(i+1), body); perr != nil && perr != errConflict {
+			return perr
+		}
+	}
+
+	if n.id == designated {
+		return n.claimEpoch()
+	}
+	n.lead = designated
+	n.isLeader = false
+	n.pendingSoft = &raft.SoftState{Lead: designated, RaftState: raft.StateFollower}
+	n.lg.Info("s3raft: genesis follower of designated (lowest-id) leader",
+		zap.String("leader", fmt.Sprintf("%x", designated)))
+	return nil
+}
+
 // start creates (or joins) the shared S3 log and returns a raft.Node
 // backed by it. peers is non-empty when bootstrapping a new cluster, in
 // which case the initial ConfChange entries are CAS-written to the log
@@ -184,19 +251,12 @@ func parseLogKey(key string) (uint64, bool) {
 // derives it (see nsFromConfig) identically across members and stably across
 // membership changes and disk-wiped restarts.
 func Start(lg *zap.Logger, rawurl string, id uint64, nsKey string, peers []raft.Peer, ms *raft.MemoryStorage) (raft.Node, error) {
-	cli, err := newClient(rawurl)
-	if err != nil {
-		return nil, err
-	}
 	// The per-cluster namespace isolates distinct clusters that share one
-	// bucket (see nsFromConfig). It is identical across all members —
-	// including members added later — and stable across membership changes,
-	// so a joining member finds the same log. Empty means the bucket/prefix
-	// itself is the cluster's log root.
-	if nsKey != "" {
-		cli.prefix += nsKey + "/"
-	}
-	if err := cli.ensureBucket(); err != nil {
+	// bucket (see nsFromConfig): identical across all members (including those
+	// added later) and stable across membership changes, so a joining member
+	// finds the same log. Empty means the bucket/prefix root is the log.
+	cli, err := openStore(rawurl, nsKey)
+	if err != nil {
 		return nil, err
 	}
 
@@ -280,58 +340,8 @@ func Start(lg *zap.Logger, rawurl string, id uint64, nsKey string, peers []raft.
 	// (see below).
 	genesis := len(peers) > 0
 	if genesis {
-		// Deterministic genesis leadership: the lowest member id is the epoch
-		// owner; the other founders boot as its followers. This avoids a
-		// boot-order race in which every founder claims the epoch and then
-		// fences down to the eventual winner — a settle window that, on a
-		// high-latency store (real S3), surfaces transient "leader changed"
-		// errors to clients. Here leadership is stable from t=0.
-		designated := id
-		for _, p := range peers {
-			if p.ID < designated {
-				designated = p.ID
-			}
-		}
-
-		// Seed the initial ConfChange entries. Idempotent: an existing log wins
-		// the CAS and is adopted by the replay below. Stamped with the genesis
-		// epoch so every founder writes identical entries regardless of which is
-		// leader or wins each index.
-		for i, p := range peers {
-			cc := &raftpb.ConfChange{
-				Type:    raftpb.ConfChangeAddNode.Enum(),
-				NodeId:  proto.Uint64(p.ID),
-				Context: p.Context,
-			}
-			data, merr := proto.Marshal(cc)
-			if merr != nil {
-				return nil, merr
-			}
-			ent := &raftpb.Entry{
-				Term:  proto.Uint64(genesisEpoch),
-				Index: proto.Uint64(uint64(i + 1)),
-				Type:  raftpb.EntryConfChange.Enum(),
-				Data:  data,
-			}
-			body, merr := encodeEntries([]*raftpb.Entry{ent})
-			if merr != nil {
-				return nil, merr
-			}
-			if perr := cli.appendCAS(uint64(i+1), uint64(i+1), body); perr != nil && perr != errConflict {
-				return nil, perr
-			}
-		}
-
-		if id == designated {
-			if err := n.claimEpoch(); err != nil {
-				return nil, err
-			}
-		} else {
-			n.lead = designated
-			n.isLeader = false
-			n.pendingSoft = &raft.SoftState{Lead: designated, RaftState: raft.StateFollower}
-			n.lg.Info("s3raft: genesis follower of designated (lowest-id) leader",
-				zap.String("leader", fmt.Sprintf("%x", designated)))
+		if err := n.seedGenesis(peers); err != nil {
+			return nil, err
 		}
 	}
 
@@ -1003,10 +1013,13 @@ func (n *node) appendBatch(batch []proposal) error {
 	return fmt.Errorf("s3raft: propose: too many CAS conflicts")
 }
 
-// Conflict backoff bounds for appendBatch's lost-race retry loop.
+// Conflict backoff bounds for the CAS retry loops (appendBatch's lost-race
+// loop and retryCAS).
 const (
 	conflictBaseBackoff = 10 * time.Millisecond
 	conflictMaxBackoff  = 500 * time.Millisecond
+	// casMaxAttempts caps a single read-modify-CAS before giving up.
+	casMaxAttempts = 64
 )
 
 // syncTail runs checkTail but no more often than minSyncInterval, so a burst

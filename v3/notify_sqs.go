@@ -16,7 +16,6 @@ package v3
 
 import (
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -59,12 +58,13 @@ func newSQSNotifierFromEnv() *SQSNotifier {
 	if q == "" {
 		return nil
 	}
+	cr := awsCredsFromEnv()
 	return &SQSNotifier{
 		QueueURL:     q,
-		Region:       envOr("ETCD_S3LOG_REGION", "us-east-1"),
-		AccessKey:    firstEnv("ETCD_S3LOG_ACCESS_KEY", "AWS_ACCESS_KEY_ID", "minioadmin"),
-		SecretKey:    firstEnv("ETCD_S3LOG_SECRET_KEY", "AWS_SECRET_ACCESS_KEY", "minioadmin"),
-		SessionToken: firstEnv("ETCD_S3LOG_SESSION_TOKEN", "AWS_SESSION_TOKEN", ""),
+		Region:       cr.region,
+		AccessKey:    cr.accessKey,
+		SecretKey:    cr.secretKey,
+		SessionToken: cr.sessionToken,
 	}
 }
 
@@ -191,18 +191,8 @@ func (s *SQSNotifier) call(ctx context.Context, form url.Values) ([]byte, error)
 	canonicalRequest := strings.Join([]string{
 		http.MethodPost, u.EscapedPath(), "", canonicalHeaders, signedHeaders, payloadHash,
 	}, "\n")
-	scope := dateStamp + "/" + s.Region + "/sqs/aws4_request"
-	stringToSign := strings.Join([]string{
-		"AWS4-HMAC-SHA256", amzDate, scope, sha256Hex([]byte(canonicalRequest)),
-	}, "\n")
-	kDate := hmacSHA256([]byte("AWS4"+s.SecretKey), dateStamp)
-	kRegion := hmacSHA256(kDate, s.Region)
-	kService := hmacSHA256(kRegion, "sqs")
-	kSigning := hmacSHA256(kService, "aws4_request")
-	signature := hex.EncodeToString(hmacSHA256(kSigning, stringToSign))
-	req.Header.Set("Authorization", fmt.Sprintf(
-		"AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s",
-		s.AccessKey, scope, signedHeaders, signature))
+	req.Header.Set("Authorization", sigV4Authorization(
+		s.AccessKey, s.SecretKey, s.Region, "sqs", amzDate, dateStamp, signedHeaders, canonicalRequest))
 
 	resp, err := s.hc.Do(req)
 	if err != nil {
@@ -243,14 +233,5 @@ func s3EventHasLogKey(payload string) bool {
 	if json.Unmarshal([]byte(payload), &ev) != nil {
 		return false
 	}
-	for _, rec := range ev.Records {
-		key := rec.S3.Object.Key
-		if dec, derr := url.QueryUnescape(key); derr == nil {
-			key = dec
-		}
-		if strings.Contains(key, "/log/") || strings.HasPrefix(key, "log/") {
-			return true
-		}
-	}
-	return false
+	return s3EventCreatesLogObject(ev)
 }
