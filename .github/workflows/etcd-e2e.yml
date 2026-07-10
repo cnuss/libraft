@@ -38,12 +38,11 @@ env:
   # etcd release the hijack + this harness are pinned to (must match the
   # go.etcd.io/etcd/server/v3 version in go.mod / tests/e2e-etcd/go.mod).
   ETCD_REF: v3.7.0
-  # Single-node functional ctl families — the apply-loop behaviors s3raft's
-  # deterministic-over-the-shared-log model must preserve (KV, txn, lease,
-  # watch, compaction, snapshot, auth). Multi-node families (member, learner,
-  # move-leader, elect, lock) are deliberately excluded: they are s3raft's
-  # documented limits and would only hang the framework waiting on a quorum.
-  E2E_SUBSET: "TestCtlV3(Put|Get|Del|Txn|Watch|Lease|Compact|Snapshot|Role|User)"
+  # Empty = run etcd's ENTIRE e2e suite (no -run filter) to map the full
+  # surface of what s3raft does and does not support. Set a regex to scope it.
+  # Both legs are non-blocking here; the deliverable is the baseline-vs-reflect
+  # failure diff in the logs, not a green gate.
+  E2E_SUBSET: ""
 
 jobs:
   e2e:
@@ -130,9 +129,10 @@ jobs:
           echo "== smoke.log (full) =="
           cat "$GITHUB_WORKSPACE/smoke.log"
 
-      - name: run etcd e2e subset (${{ matrix.mode }})
+      - name: run etcd e2e (${{ matrix.mode }})
         id: e2e
-        continue-on-error: ${{ matrix.mode == 'reflect' }}
+        # Both legs non-blocking: we are mapping the failure surface, not gating.
+        continue-on-error: true
         working-directory: etcd/tests
         env:
           # Only set for the reflect leg; the spawned etcd inherits this env, so
@@ -140,22 +140,28 @@ jobs:
           ETCD_S3LOG_URL: ${{ matrix.mode == 'reflect' && 'http://127.0.0.1:9000/etcd-e2e' || '' }}
           AWS_ACCESS_KEY_ID: ${{ matrix.mode == 'reflect' && 'minioadmin' || '' }}
           AWS_SECRET_ACCESS_KEY: ${{ matrix.mode == 'reflect' && 'minioadmin' || '' }}
-          # Make the e2e framework print each etcd process's full output, so a
-          # startup crash under the hijack shows its panic, not a truncated tail.
-          EXPECT_DEBUG: ${{ matrix.mode == 'reflect' && '1' || '' }}
         run: |
-          echo "mode=${{ matrix.mode }}  subset=${E2E_SUBSET}"
-          go test ./e2e -run "${E2E_SUBSET}" -count=1 -v -timeout 20m 2>&1 | tee "$GITHUB_WORKSPACE/e2e-${{ matrix.mode }}.log"
+          RUN=""
+          [ -n "${E2E_SUBSET}" ] && RUN="-run ${E2E_SUBSET}"
+          echo "mode=${{ matrix.mode }}  scope='${E2E_SUBSET:-<full suite>}'"
+          # -p 2 caps concurrent test binaries so parallel multi-node clusters
+          # don't exhaust ports/CPU; -timeout bounds a hang under the hijack.
+          go test ./e2e ${RUN} -count=1 -v -p 2 -timeout 90m 2>&1 \
+            | tee "$GITHUB_WORKSPACE/e2e-${{ matrix.mode }}.log"
 
       - name: summarize
         if: always()
         run: |
-          echo "### etcd-e2e (${{ matrix.mode }})" >> "$GITHUB_STEP_SUMMARY"
-          echo "outcome: ${{ steps.e2e.outcome }}" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          grep -E '^(=== RUN|--- (PASS|FAIL|SKIP)|PASS|FAIL|ok |panic)' \
-            "$GITHUB_WORKSPACE/e2e-${{ matrix.mode }}.log" 2>/dev/null | tail -80 >> "$GITHUB_STEP_SUMMARY" || true
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          L="$GITHUB_WORKSPACE/e2e-${{ matrix.mode }}.log"
+          {
+            echo "### etcd-e2e (${{ matrix.mode }}) — step ${{ steps.e2e.outcome }}"
+            echo "PASS: $(grep -ac -- '--- PASS' "$L" 2>/dev/null)  FAIL: $(grep -ac -- '--- FAIL' "$L" 2>/dev/null)  SKIP: $(grep -ac -- '--- SKIP' "$L" 2>/dev/null)"
+            echo ""
+            echo "Failing tests:"
+            echo '```'
+            grep -aoE '\-\-\- FAIL: [A-Za-z0-9_/]+' "$L" 2>/dev/null | sed 's/^--- FAIL: //' | sort -u || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: upload logs
         if: always()
