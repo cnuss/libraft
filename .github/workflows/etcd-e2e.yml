@@ -38,9 +38,12 @@ env:
   # etcd release the hijack + this harness are pinned to (must match the
   # go.etcd.io/etcd/server/v3 version in go.mod / tests/e2e-etcd/go.mod).
   ETCD_REF: v3.7.0
-  # Single-node KV/ctl tests to start from. Deliberately small; grow as the
-  # reflect leg is shown to pass more (issue #20).
-  E2E_SUBSET: "TestCtlV3Put|TestCtlV3Get|TestCtlV3Del"
+  # Single-node functional ctl families — the apply-loop behaviors s3raft's
+  # deterministic-over-the-shared-log model must preserve (KV, txn, lease,
+  # watch, compaction, snapshot, auth). Multi-node families (member, learner,
+  # move-leader, elect, lock) are deliberately excluded: they are s3raft's
+  # documented limits and would only hang the framework waiting on a quorum.
+  E2E_SUBSET: "TestCtlV3(Put|Get|Del|Txn|Watch|Lease|Compact|Snapshot|Role|User)"
 
 jobs:
   e2e:
