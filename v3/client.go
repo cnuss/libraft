@@ -110,15 +110,14 @@ func newClient(rawurl string) (*client, error) {
 	if parts[0] == "" {
 		return nil, fmt.Errorf("s3raft: url %q missing bucket path", rawurl)
 	}
+	cr := awsCredsFromEnv()
 	c := &client{
-		endpoint:  &url.URL{Scheme: u.Scheme, Host: u.Host},
-		bucket:    parts[0],
-		region:    envOr("ETCD_S3LOG_REGION", "us-east-1"),
-		accessKey: firstEnv("ETCD_S3LOG_ACCESS_KEY", "AWS_ACCESS_KEY_ID", "minioadmin"),
-		secretKey: firstEnv("ETCD_S3LOG_SECRET_KEY", "AWS_SECRET_ACCESS_KEY", "minioadmin"),
-		// Temporary credentials from an assumed IAM role (EKS/EC2/IRSA) carry a
-		// session token; if present it must be signed as X-Amz-Security-Token.
-		sessionToken: firstEnv("ETCD_S3LOG_SESSION_TOKEN", "AWS_SESSION_TOKEN", ""),
+		endpoint:     &url.URL{Scheme: u.Scheme, Host: u.Host},
+		bucket:       parts[0],
+		region:       cr.region,
+		accessKey:    cr.accessKey,
+		secretKey:    cr.secretKey,
+		sessionToken: cr.sessionToken,
 		// Optional server-side encryption for log/snapshot objects.
 		sse:       firstEnv("ETCD_S3LOG_SSE", "", ""),
 		sseKMSKey: firstEnv("ETCD_S3LOG_SSE_KMS_KEY_ID", "", ""),
@@ -128,6 +127,24 @@ func newClient(rawurl string) (*client, error) {
 		c.prefix = parts[1] + "/"
 	}
 	return c, nil
+}
+
+// openStore builds an S3 client for rawurl, scopes it to the per-cluster
+// namespace ns (empty = the bucket/prefix root), and verifies the store can
+// back the log (ensureBucket, which also probes CAS support). Both the node
+// (Start) and the checkpointer open the store this one way.
+func openStore(rawurl, ns string) (*client, error) {
+	cli, err := newClient(rawurl)
+	if err != nil {
+		return nil, err
+	}
+	if ns != "" {
+		cli.prefix += ns + "/"
+	}
+	if err := cli.ensureBucket(); err != nil {
+		return nil, err
+	}
+	return cli, nil
 }
 
 func envOr(k, def string) string {
@@ -145,6 +162,42 @@ func firstEnv(k1, k2, def string) string {
 		return v
 	}
 	return def
+}
+
+// awsCreds holds the resolved credential + region environment shared by the S3
+// client and the SQS notifier, so both derive them one way.
+type awsCreds struct {
+	accessKey, secretKey, sessionToken, region string
+}
+
+// awsCredsFromEnv resolves credentials from ETCD_S3LOG_* then AWS_* then the
+// minioadmin default. A session token (from an assumed IAM role — EKS/EC2/IRSA)
+// is signed as X-Amz-Security-Token when present.
+func awsCredsFromEnv() awsCreds {
+	return awsCreds{
+		accessKey:    firstEnv("ETCD_S3LOG_ACCESS_KEY", "AWS_ACCESS_KEY_ID", "minioadmin"),
+		secretKey:    firstEnv("ETCD_S3LOG_SECRET_KEY", "AWS_SECRET_ACCESS_KEY", "minioadmin"),
+		sessionToken: firstEnv("ETCD_S3LOG_SESSION_TOKEN", "AWS_SESSION_TOKEN", ""),
+		region:       envOr("ETCD_S3LOG_REGION", "us-east-1"),
+	}
+}
+
+// sigV4Authorization computes the SigV4 signature over canonicalRequest and
+// returns the Authorization header value. Shared by the S3 client and the SQS
+// notifier; service is "s3" or "sqs".
+func sigV4Authorization(accessKey, secretKey, region, service, amzDate, dateStamp, signedHeaders, canonicalRequest string) string {
+	scope := dateStamp + "/" + region + "/" + service + "/aws4_request"
+	stringToSign := strings.Join([]string{
+		"AWS4-HMAC-SHA256", amzDate, scope, sha256Hex([]byte(canonicalRequest)),
+	}, "\n")
+	kDate := hmacSHA256([]byte("AWS4"+secretKey), dateStamp)
+	kRegion := hmacSHA256(kDate, region)
+	kService := hmacSHA256(kRegion, service)
+	kSigning := hmacSHA256(kService, "aws4_request")
+	signature := hex.EncodeToString(hmacSHA256(kSigning, stringToSign))
+	return fmt.Sprintf(
+		"AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s",
+		accessKey, scope, signedHeaders, signature)
 }
 
 // ensureBucket creates the bucket (tolerating "already exists") and probes
@@ -299,13 +352,9 @@ func (c *client) appendCAS(firstIdx, lastIdx uint64, body []byte) error {
 		}
 	}
 
-	raw, etag, err := c.getWithETag(headKey)
+	h, etag, err := c.loadHead()
 	if err != nil {
 		return err
-	}
-	var h head
-	if err := json.Unmarshal(raw, &h); err != nil {
-		return fmt.Errorf("s3raft: corrupt HEAD object: %w", err)
 	}
 	if h.Index >= firstIdx {
 		return errConflict // someone already claimed our range
@@ -330,43 +379,67 @@ func (c *client) appendCAS(firstIdx, lastIdx uint64, body []byte) error {
 	return c.put(logKey(lastIdx), body)
 }
 
+// loadHead reads and decodes the HEAD pointer, returning its ETag so callers
+// that CAS on it (appendCAS, seedHead) can pass the ETag to putIfMatch.
+func (c *client) loadHead() (head, string, error) {
+	var h head
+	raw, etag, err := c.getWithETag(headKey)
+	if err != nil {
+		return h, "", err
+	}
+	if err := json.Unmarshal(raw, &h); err != nil {
+		return h, "", fmt.Errorf("s3raft: corrupt HEAD object: %w", err)
+	}
+	return h, etag, nil
+}
+
 // readHead returns the current HEAD pointer (etagChain mode). HEAD is the
 // authoritative commit point: a batch is linearizably committed the instant its
 // If-Match CAS advances HEAD, which happens before the per-index log object is
 // published. Readers must consult HEAD (not just log/ objects) to observe the
 // true committed index.
 func (c *client) readHead() (head, error) {
-	var h head
-	raw, _, err := c.getWithETag(headKey)
-	if err != nil {
-		return h, err
-	}
-	if err := json.Unmarshal(raw, &h); err != nil {
-		return h, fmt.Errorf("s3raft: corrupt HEAD object: %w", err)
-	}
-	return h, nil
+	h, _, err := c.loadHead()
+	return h, err
 }
 
 // seedHead advances the HEAD pointer to index (etagChain mode) when the log is
 // being bootstrapped from restored local state — see node.seedLogFromLocal.
 // No-op if HEAD already reached index (a peer seeded concurrently).
 func (c *client) seedHead(index uint64) error {
-	raw, etag, err := c.getWithETag(headKey)
-	if err != nil {
-		return err
+	return retryCAS(func() error {
+		h, etag, err := c.loadHead()
+		if err != nil {
+			return err
+		}
+		if h.Index >= index {
+			return nil // already at/past index (a peer seeded concurrently)
+		}
+		body, err := json.Marshal(head{Index: index})
+		if err != nil {
+			return err
+		}
+		return c.putIfMatch(headKey, body, etag)
+	})
+}
+
+// retryCAS runs fn until it stops returning errConflict, backing off with
+// jitter between conflicting attempts so concurrent writers to one hot object
+// (e.g. every founder bumping meta/epoch at genesis) decorrelate instead of
+// thrashing. It gives up after casMaxAttempts.
+func retryCAS(fn func() error) error {
+	backoff := conflictBaseBackoff
+	for attempt := 0; attempt < casMaxAttempts; attempt++ {
+		err := fn()
+		if err != errConflict {
+			return err // nil (won), or a real error
+		}
+		time.Sleep(backoff + jitter(backoff))
+		if backoff *= 2; backoff > conflictMaxBackoff {
+			backoff = conflictMaxBackoff
+		}
 	}
-	var h head
-	if err := json.Unmarshal(raw, &h); err != nil {
-		return fmt.Errorf("s3raft: corrupt HEAD object: %w", err)
-	}
-	if h.Index >= index {
-		return nil
-	}
-	body, err := json.Marshal(head{Index: index})
-	if err != nil {
-		return err
-	}
-	return c.putIfMatch(headKey, body, etag)
+	return fmt.Errorf("s3raft: too many CAS conflicts")
 }
 
 // bumpEpoch atomically increments the fencing epoch and installs owner as
@@ -374,43 +447,41 @@ func (c *client) seedHead(index uint64) error {
 // exact-ETag If-Match CAS is supported by AWS S3 (since Nov 2024), MinIO
 // and LocalStack.
 func (c *client) bumpEpoch(owner uint64) (uint64, error) {
-	for range 64 {
+	var claimed uint64
+	err := retryCAS(func() error {
 		raw, etag, err := c.getWithETag(epochKey)
 		if err == errNotFound {
 			// Genesis: unconditional PUT of byte-identical content; racers
-			// converge on the same object and settle in the CAS below.
+			// converge on the same object and settle in the CAS on retry.
 			body, merr := json.Marshal(epochDoc{})
 			if merr != nil {
-				return 0, merr
+				return merr
 			}
 			if perr := c.put(epochKey, body); perr != nil {
-				return 0, perr
+				return perr
 			}
-			continue
+			return errConflict // created; re-read and CAS on top
 		}
 		if err != nil {
-			return 0, err
+			return err
 		}
 		var d epochDoc
 		if err := json.Unmarshal(raw, &d); err != nil {
-			return 0, fmt.Errorf("s3raft: corrupt epoch object: %w", err)
+			return fmt.Errorf("s3raft: corrupt epoch object: %w", err)
 		}
 		d.Epoch++
 		d.Owner = owner
 		body, err := json.Marshal(d)
 		if err != nil {
-			return 0, err
+			return err
 		}
-		switch err := c.putIfMatch(epochKey, body, etag); err {
-		case nil:
-			return d.Epoch, nil
-		case errConflict:
-			continue // another node bumped concurrently; retry on top
-		default:
-			return 0, err
+		if err := c.putIfMatch(epochKey, body, etag); err != nil {
+			return err // errConflict → retry on top; else propagate
 		}
-	}
-	return 0, fmt.Errorf("s3raft: bump epoch: too many CAS conflicts")
+		claimed = d.Epoch
+		return nil
+	})
+	return claimed, err
 }
 
 // currentEpoch reads the epoch object without modifying it.
@@ -723,23 +794,8 @@ func (c *client) signedRequest(method, key string, query url.Values, body []byte
 		payloadHash,
 	}, "\n")
 
-	scope := dateStamp + "/" + c.region + "/s3/aws4_request"
-	stringToSign := strings.Join([]string{
-		"AWS4-HMAC-SHA256",
-		amzDate,
-		scope,
-		sha256Hex([]byte(canonicalRequest)),
-	}, "\n")
-
-	kDate := hmacSHA256([]byte("AWS4"+c.secretKey), dateStamp)
-	kRegion := hmacSHA256(kDate, c.region)
-	kService := hmacSHA256(kRegion, "s3")
-	kSigning := hmacSHA256(kService, "aws4_request")
-	signature := hex.EncodeToString(hmacSHA256(kSigning, stringToSign))
-
-	req.Header.Set("Authorization", fmt.Sprintf(
-		"AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s",
-		c.accessKey, scope, signedHeaders, signature))
+	req.Header.Set("Authorization", sigV4Authorization(
+		c.accessKey, c.secretKey, c.region, "s3", amzDate, dateStamp, signedHeaders, canonicalRequest))
 	return req, nil
 }
 

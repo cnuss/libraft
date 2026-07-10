@@ -18,6 +18,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -301,15 +303,13 @@ func minPeerURL(cfg config.ServerConfig) string {
 	return min
 }
 
+// fnv64a hashes s with the standard 64-bit FNV-1a. It backs the per-cluster
+// namespace key (nsFromConfig); the value only needs to be stable and
+// well-distributed, not any particular basis.
 func fnv64a(s string) uint64 {
-	const offset = 1469598103934665603
-	const prime = 1099511628211
-	h := uint64(offset)
-	for i := 0; i < len(s); i++ {
-		h ^= uint64(s[i])
-		h *= prime
-	}
-	return h
+	h := fnv.New64a()
+	h.Write([]byte(s))
+	return h.Sum64()
 }
 
 // prepareRestore downloads the latest bucket snapshot and stages it for
@@ -361,18 +361,10 @@ func prepareRestore(lg *zap.Logger, cfg config.ServerConfig) error {
 
 // checkpointClient builds an S3 client scoped to the active namespace.
 func checkpointClient() (*client, error) {
-	cli, err := newClient(os.Getenv(EnvURL))
-	if err != nil {
-		return nil, err
-	}
 	if ActiveNS == "" {
 		return nil, fmt.Errorf("s3raft: checkpoint namespace not set")
 	}
-	cli.prefix += ActiveNS + "/"
-	if err := cli.ensureBucket(); err != nil {
-		return nil, err
-	}
-	return cli, nil
+	return openStore(os.Getenv(EnvURL), ActiveNS)
 }
 
 func snapDBKey(index uint64) string { return fmt.Sprintf("snap/%020d.db", index) }
@@ -550,7 +542,7 @@ func (n *node) truncationFloor(cli *client) uint64 {
 	if err != nil || len(keys) == 0 {
 		return 0
 	}
-	min := ^uint64(0)
+	min := uint64(math.MaxUint64)
 	for _, k := range keys {
 		raw, gerr := cli.get(k)
 		if gerr != nil {
@@ -564,7 +556,7 @@ func (n *node) truncationFloor(cli *client) uint64 {
 			min = p.SnapshotIndex
 		}
 	}
-	if min == ^uint64(0) {
+	if min == math.MaxUint64 {
 		return 0
 	}
 	return min
