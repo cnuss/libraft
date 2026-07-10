@@ -13,7 +13,8 @@ Deep-link by filename; line numbers will drift.
 | Monkey-patch mechanism (overview)              | [README → The install seam](./README.md#the-install-seam)        |
 | Behavioral limits + force-new-cluster          | [`v3/LIMITATIONS.md`](./v3/LIMITATIONS.md)                       |
 | TLA+ model of the CAS log ordering             | [`v3/tla/`](./v3/tla)                                            |
-| Installer (`init`, `s3StartNode`, `patchFunc`) | [`v3/reflect/init.go`](./v3/reflect/init.go)                     |
+| Installer (`init`, `patchFunc`, linkname target) | [`v3/reflect/init.go`](./v3/reflect/init.go), [`v3/reflect/newraftnode.go`](./v3/reflect/newraftnode.go) |
+| `NewRaftNode` replacement + layout mirrors     | [`v3/newraftnode.go`](./v3/newraftnode.go)                       |
 | Platform patch primitives                      | [`v3/reflect/init_darwin.go`](./v3/reflect/init_darwin.go), [`init_windows.go`](./v3/reflect/init_windows.go), [`init_other.go`](./v3/reflect/init_other.go) |
 | S3 CAS client                                  | [`v3/client.go`](./v3/client.go)                                 |
 | raft.Node over the S3 log + `Start`            | [`v3/node.go`](./v3/node.go)                                     |
@@ -40,16 +41,19 @@ github.com/cnuss/libraft/v3          — s3raft core: S3 CAS log, raft.Node over
                                      the log, bbolt checkpoint/restore, notify,
                                      batch, metrics.
 github.com/cnuss/libraft/v3/reflect  — the installer: monkey-patches etcd's
-                                     raft entry points into the core.
+                                     raft construction into the core.
 ```
 
 A host blank-imports the root package (which pulls in `v3/reflect`); the
 installer's `init` (when `ETCD_S3LOG_URL` is set) rewrites the prologue of
-`raft.StartNode`, `raft.RestartNode` and `serverstorage.OpenBackend` to jump
-into the core. The core exports the seam the installer calls: `Start`,
-`S3OpenBackend`, `ActiveNS`, `EnvURL`, `Logger`. The monkey-patch is
-intentional and load-bearing — never replace it with a source edit (see the
-patch-target rules under Conventions that bite).
+`(*bootstrappedRaft).newRaftNode` and `serverstorage.OpenBackend` to jump into
+the core. The core exports the seam the installer calls: `Start`,
+`NewRaftNode`, `S3OpenBackend`, `ActiveNS`, `EnvURL`, `Logger`. The
+reconstruction of etcd's unexported `raftNode` lives in the core
+(`v3/newraftnode.go`), since it is node-construction logic; `v3/reflect` only
+supplies the patch-target address (via `//go:linkname`) and does the overwrite.
+The monkey-patch is intentional and load-bearing — never replace it with a
+source edit (see the patch-target rules under Conventions that bite).
 
 ## Provenance
 
@@ -118,26 +122,35 @@ Easy to get wrong from the diff alone:
   analyzer flags as misuse. The Makefile's `vet` and `windows` targets disable
   that one analyzer; keep it off, don't rewrite the patcher to appease it (the
   mechanism is load-bearing).
-- **Only patch exported entry points in far modules** (`go.etcd.io/raft`,
-  `server/v3/storage`) — never a symbol inside `etcdserver`, however
-  convenient. Patching `bootstrappedRaft.newRaftNode` was tried and reverted
-  (2026-07-10): the patcher is linked into the same binary at an uncontrolled
-  offset, so the target's 16 KB text page can contain the patcher's own
-  helpers (`flushICache`/`setExecutable`/trampolines) depending on link
-  layout — which varies between builds. Making that page writable de-executes
-  the running patcher mid-patch → SIGBUS that smoke tests miss and e2e hits.
-  Moving the patcher into its own package does NOT fix this (same binary, same
-  uncontrolled layout); far-module targets are pages away and never collide.
-  If the etcd cluster ID is ever wanted for namespacing, derive it inside the
-  already-safe `S3OpenBackend` seam (from `ServerConfig`/WAL metadata), or
-  first build a robust patcher that writes through a separate RW alias
-  (`mach_vm_remap`) — do not reintroduce an in-`etcdserver` patch.
-- **Verify a patch actually lands** when touching the installer or its
-  targets — inlining and same-page traps are silent:
-  ```sh
-  go tool nm bin/etcd | grep <symbol>      # link addresses
-  go tool objdump bin/etcd -s <symbol>     # confirm not inlined away
-  ```
+- **The patch target is `(*bootstrappedRaft).newRaftNode`, an unexported
+  `etcdserver` symbol — and that co-location is a live hazard.** The patcher
+  makes the target's text page writable mid-install; if the linker places any
+  of the patcher's own helpers (`flushICache`/`setExecutable`/trampolines) on
+  that same 16 KB page, the running patcher de-executes itself → SIGBUS. This
+  exact crash was hit and reverted once (2026-07-10). It works now only because
+  the patcher lives in its own `v3/reflect` package that the linker places
+  pages away from `etcdserver` — in the current binaries `newRaftNode` and
+  `reflect.writeText` sit ~1.3 MB apart. This is **not guaranteed** for every
+  host binary; a different link layout could re-collide. So:
+  - **Verify the gap holds** whenever you touch the installer, its target, or
+    bump etcd — inlining and same-page traps are silent:
+    ```sh
+    go tool nm bin/etcd | grep -E 'newRaftNode|reflect\.writeText'  # must be pages apart
+    go tool objdump bin/etcd -s newRaftNode                         # confirm not inlined
+    ```
+  - **The real fix, if this ever collides**, is a robust patcher that writes
+    through a separate RW alias (`mach_vm_remap`) so the executing mapping never
+    loses execute — eliminating the whole same-page class. Don't paper over a
+    collision by relocating code and hoping.
+- **The layout mirrors in `v3/newraftnode.go` are pinned to a specific etcd
+  version** (v3.7.0). They reconstruct etcd's unexported `raftNode` /
+  `raftNodeConfig` / `bootstrappedRaft` by field-for-field memory layout; a
+  plain field reorder or addition upstream silently corrupts state. Re-check
+  the mirrors against `etcdserver/raft.go` + `bootstrap.go` on every etcd bump.
+- **`//go:linkname` reaches the target's address across the module boundary.**
+  It needs `import _ "unsafe"` and a blank import of `etcdserver` so the symbol
+  is linked (see `v3/reflect/newraftnode.go`). The linkname'd handle is never
+  called — only its `.Pointer()` is taken as the patch source.
 - **The patcher is platform- and arch-specific.** `//go:build` tags partition
   `init_darwin.go` (mach_vm_protect) / `init_windows.go` (VirtualProtect) /
   `init_other.go` (mprotect); amd64 + arm64. Adding a platform means adding a
@@ -172,12 +185,15 @@ force-new-cluster) makes s3raft credible for low-write control planes (see
 left:
 
 1. **Sealed writes / integrity** — no per-entry checksum, and no cluster-ID
-   stamp / bucket-mismatch guard. The namespace key is a proxy —
+   stamp / bucket-mismatch guard. The namespace key is still a proxy —
    `root|InitialClusterToken|minPeerURL` (`nsFromConfig`, checkpoint.go) — not
    the etcd cluster ID, so two different clusters aimed at the same
-   bucket/prefix are not hard-fenced. Fix: derive the real cluster ID inside
-   the `S3OpenBackend` seam and stamp it into `meta/` (see the patch-target
-   rule above for why not via a new patch).
+   bucket/prefix are not hard-fenced. The `newRaftNode` seam now *reaches* the
+   real cluster ID (`cl.ID()` in `v3.NewRaftNode`, currently only logged); wire
+   it into the namespace and stamp it into `meta/`. Note the ordering: the
+   namespace is resolved in `S3OpenBackend`, which runs *before* `newRaftNode`,
+   so either move ID derivation into `S3OpenBackend` (compute it from
+   `ServerConfig`) or defer namespace finalization until the ID is in hand.
 2. **Multipart uploads** — snapshots and entries >5 MB use a single PUT; real
    S3 needs multipart. Related: request-pricing telemetry, IAM-scoped creds,
    TLS review.
@@ -196,8 +212,8 @@ left:
    needs `--initial-cluster-state existing` (a lone node with `existing` tries
    to fetch cluster info and dies). Behavioral edges in
    [`v3/LIMITATIONS.md`](./v3/LIMITATIONS.md).
-7. **`ActiveNS` cross-package global** — `S3OpenBackend` sets it, the
-   installer reads it. Safe today (OpenBackend always runs before StartNode,
+7. **`ActiveNS` cross-package global** — `S3OpenBackend` sets it, `NewRaftNode`
+   reads it. Safe today (OpenBackend always runs before newRaftNode,
    single-threaded at boot); make it an explicit parameter if the seam grows.
 8. **Housekeeping** — `node.go` (~1300 lines) wants splitting (run loop /
    reconcile / force-new); extract sigv4 signing from `client.go`;

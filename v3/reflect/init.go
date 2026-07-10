@@ -1,24 +1,31 @@
 // This file installs s3raft as a drop-in replacement for the raft
 // algorithm WITHOUT modifying any etcd source: the only change to the tree
 // is a blank import of this package. When ETCD_S3LOG_URL is set, init()
-// rewrites the machine-code prologue of raft.StartNode and raft.RestartNode
-// with an unconditional jump to our replacements.
+// rewrites the machine-code prologue of two functions with an unconditional
+// jump to our replacements:
 //
-// Why not a cleaner seam? etcd calls raft.StartNode/RestartNode directly
-// from an unexported method (bootstrappedRaft.newRaftNode); with the source
-// frozen there is no function variable, interface, or build tag to hook.
-// Pure reflection cannot rewrite a compiled function body, so the honest
-// mechanism is a classic monkey patch: reflect supplies the code addresses,
-// unsafe + mprotect performs the overwrite. We patch the EXPORTED raft
-// entry points (not the unexported etcd method) so the replacements are
-// expressible with exported types alone and reconstruct everything they
-// need — member id, peer set, MemoryStorage — from *raft.Config.
+//   - (*bootstrappedRaft).newRaftNode — the sole raft-construction site.
+//     Our replacement builds the raft.Node from the S3 log (v3.Start) instead
+//     of raft.StartNode/RestartNode. Because this call site also carries the
+//     snapshotter, WAL, and *membership.RaftCluster, the replacement reaches
+//     the etcd cluster ID (cl.ID()) that the raft.StartNode seam cannot see.
+//   - serverstorage.OpenBackend — captures the bbolt backend for checkpointing
+//     and restores it from the bucket on a disk-wiped start; it also resolves
+//     v3.ActiveNS (the per-cluster namespace) before newRaftNode runs.
+//
+// Why a monkey patch? etcd constructs the raft node from an unexported method
+// with the source frozen: no function variable, interface, or build tag to
+// hook. Pure reflection cannot rewrite a compiled function body, so reflect
+// supplies the code addresses and unsafe + mprotect performs the overwrite.
+// newRaftNode is unexported, so its address is reached via //go:linkname and
+// its unexported argument/return types are reconstructed as byte-identical
+// layout mirrors (see experiment_newraftnode.go).
 //
 // This is a proof-of-concept technique. It is architecture-specific
 // (amd64, arm64), depends on the process being able to mprotect its own
 // text pages (true for standard `go build` binaries; may fail under a
-// hardened runtime), and permanently redirects the raft entry points for
-// the lifetime of the process.
+// hardened runtime), and permanently redirects the entry points for the
+// lifetime of the process.
 
 package reflect
 
@@ -33,7 +40,6 @@ import (
 	"go.uber.org/zap"
 
 	serverstorage "go.etcd.io/etcd/server/v3/storage"
-	"go.etcd.io/raft/v3"
 )
 
 func init() {
@@ -50,48 +56,18 @@ func init() {
 		}
 	}()
 
-	// Redirect the raft constructors. StartNode(cfg, peers) is the
-	// fresh-cluster path; RestartNode(cfg) is the recover-from-WAL path.
-	patchFunc(reflect.ValueOf(raft.StartNode).Pointer(), reflect.ValueOf(s3StartNode).Pointer())
-	patchFunc(reflect.ValueOf(raft.RestartNode).Pointer(), reflect.ValueOf(s3RestartNode).Pointer())
-
-	// Redirect the backend opener so we can capture the bbolt backend for
-	// checkpointing and restore it from the bucket on a disk-wiped start.
+	// Redirect the backend opener first so it captures the bbolt backend and
+	// resolves v3.ActiveNS before the node seam fires. (init patches run in
+	// source order; keep OpenBackend ahead of newRaftNode.)
 	patchFunc(reflect.ValueOf(serverstorage.OpenBackend).Pointer(), reflect.ValueOf(v3.S3OpenBackend).Pointer())
 
-	lg.Info("s3raft: hijacked raft.StartNode/RestartNode and OpenBackend",
+	// Redirect the single raft-construction seam. v3.NewRaftNode builds the
+	// raft.Node from the S3 log via v3.Start.
+	patchFunc(reflect.ValueOf(etcdNewRaftNode).Pointer(), reflect.ValueOf(v3.NewRaftNode).Pointer())
+
+	lg.Info("s3raft: hijacked (*bootstrappedRaft).newRaftNode and OpenBackend",
 		zap.String("url", rawurl),
 		zap.String("arch", runtime.GOARCH))
-}
-
-// s3StartNode replaces raft.StartNode for the fresh-cluster path. Signature
-// MUST match raft.StartNode exactly so the jumped-to ABI lines up.
-func s3StartNode(c *raft.Config, peers []raft.Peer) raft.Node {
-	return s3Node(c, peers)
-}
-
-// s3RestartNode replaces raft.RestartNode for the WAL-recovery path. There
-// are no peers here; the member set is recovered from the ConfState that
-// bootstrap seeded into the MemoryStorage.
-func s3RestartNode(c *raft.Config) raft.Node {
-	return s3Node(c, nil)
-}
-
-// s3Node is the shared body: hand the bucket namespace the OpenBackend hijack
-// derived (activeNS) off to start(). OpenBackend and StartNode/RestartNode are
-// patched together, so OpenBackend always runs first and sets activeNS; an
-// empty activeNS (only when the backend was not hijacked, e.g. a unit test
-// exercising the node directly) means the bucket/prefix root is the log.
-func s3Node(c *raft.Config, peers []raft.Peer) raft.Node {
-	ms, ok := c.Storage.(*raft.MemoryStorage)
-	if !ok {
-		panic(fmt.Sprintf("s3raft: expected *raft.MemoryStorage, got %T", c.Storage))
-	}
-	n, err := v3.Start(v3.Logger(), os.Getenv(v3.EnvURL), c.ID, v3.ActiveNS, peers, ms)
-	if err != nil {
-		panic(fmt.Sprintf("s3raft: start: %v", err))
-	}
-	return n
 }
 
 // patchFunc overwrites the prologue of the function at `from` with an
@@ -137,7 +113,7 @@ func putUint64(b []byte, v uint64) {
 // writeText copies code into executable memory at addr, temporarily making
 // the page(s) writable, then flushing the instruction cache for the patched
 // range. The setWritable / setExecutable / flushICache primitives are
-// platform-specific (see hijack_darwin.go and hijack_other.go): W^X targets
+// platform-specific (see init_darwin.go and init_other.go): W^X targets
 // like Apple Silicon forbid a writable+executable mapping and refuse a
 // plain mprotect on signed text, so darwin uses mach_vm_protect with
 // VM_PROT_COPY to break copy-on-write into a private writable page.

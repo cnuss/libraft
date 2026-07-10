@@ -28,7 +28,7 @@ go get github.com/cnuss/libraft
 ```
 
 Blank-import libraft in the etcd binary's `main` (or any program embedding
-etcd); it patches `raft.StartNode`, `raft.RestartNode` and
+etcd); it patches `(*bootstrappedRaft).newRaftNode` and
 `serverstorage.OpenBackend` at `init` when `ETCD_S3LOG_URL` is set (a no-op
 otherwise):
 
@@ -74,31 +74,39 @@ github.com/cnuss/libraft/v3          — s3raft core: S3 CAS log, raft.Node over
                                      the log, bbolt checkpoint/restore, notify,
                                      batch, metrics.
 github.com/cnuss/libraft/v3/reflect  — the installer: monkey-patches etcd's
-                                     raft entry points into the core.
+                                     raft construction into the core.
 ```
 
 Hosts blank-import the root package (which pulls in `v3/reflect`); the core
 exports the seam the installer calls
-(`Start`, `S3OpenBackend`, `ActiveNS`, `EnvURL`, `Logger`). For the
-file-by-file map, see
+(`Start`, `NewRaftNode`, `S3OpenBackend`, `ActiveNS`, `EnvURL`, `Logger`). For
+the file-by-file map, see
 [CONTRIBUTING.md → Where to find things](./CONTRIBUTING.md#where-to-find-things).
 
 ## The install seam
 
-The installer rewrites the machine-code prologue of three exported functions
-with an unconditional jump into the core:
+The installer rewrites the machine-code prologue of two functions with an
+unconditional jump into the core:
 
-| Patched target              | Replacement                    |
-| --------------------------- | ------------------------------ |
-| `raft.StartNode`            | `s3StartNode` → `v3.Start`     |
-| `raft.RestartNode`          | `s3RestartNode` → `v3.Start`   |
-| `serverstorage.OpenBackend` | `v3.S3OpenBackend`             |
+| Patched target                     | Replacement                     |
+| ---------------------------------- | ------------------------------- |
+| `(*bootstrappedRaft).newRaftNode`  | `v3.NewRaftNode` → `v3.Start`   |
+| `serverstorage.OpenBackend`        | `v3.S3OpenBackend`              |
 
-Only exported far-module entry points are patched (never etcd's unexported
-`newRaftNode`), so the replacements are expressible with exported types alone
-and never collide with the patcher's own text pages. Platform primitives:
-`mach_vm_protect` on darwin, `mprotect` on linux, `VirtualProtect` on windows;
-amd64 and arm64.
+`newRaftNode` is etcd's sole raft-construction site — the one call that also
+carries the snapshotter, WAL, and `*membership.RaftCluster` (whose `ID()` is
+the etcd cluster ID). It is unexported, so its code address is reached with
+`//go:linkname` and its unexported argument/return types are reconstructed as
+byte-identical layout mirrors in `v3.NewRaftNode`; etcd calls its own methods
+on the returned pointer, so only the memory layout must match. Platform
+primitives: `mach_vm_protect` on darwin, `mprotect` on linux, `VirtualProtect`
+on windows; amd64 and arm64.
+
+Patching an unexported symbol inside `etcdserver` was once reverted for a
+build-layout-dependent SIGBUS (the target's text page could share with the
+patcher's own helpers). It is safe here because the patcher lives in a separate
+package that the linker places pages away from `etcdserver`; verify with
+`go tool nm` when touching the installer (see CONTRIBUTING).
 
 ## When to use it
 
