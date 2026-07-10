@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -301,15 +302,13 @@ func minPeerURL(cfg config.ServerConfig) string {
 	return min
 }
 
+// fnv64a hashes s with the standard 64-bit FNV-1a. It backs the per-cluster
+// namespace key (nsFromConfig); the value only needs to be stable and
+// well-distributed, not any particular basis.
 func fnv64a(s string) uint64 {
-	const offset = 1469598103934665603
-	const prime = 1099511628211
-	h := uint64(offset)
-	for i := 0; i < len(s); i++ {
-		h ^= uint64(s[i])
-		h *= prime
-	}
-	return h
+	h := fnv.New64a()
+	h.Write([]byte(s))
+	return h.Sum64()
 }
 
 // prepareRestore downloads the latest bucket snapshot and stages it for
