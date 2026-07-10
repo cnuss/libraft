@@ -65,7 +65,7 @@ func TestExamples(t *testing.T) {
 		name string
 		want string
 	}{
-		{"basic", "node: *v1alpha1.NodeImpl"},
+		{"basic", "s3raft installed; set ETCD_S3LOG_URL to activate"},
 	}
 	for _, tc := range cases {
 		tc := tc

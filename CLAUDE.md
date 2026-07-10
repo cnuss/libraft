@@ -6,10 +6,12 @@ agent-specific framing.
 
 ## Read first, in order
 
-1. [README.md](./README.md) — what the library does + public surface
+1. [README.md](./README.md) — what the library does + the install seam
 2. [CONTRIBUTING.md](./CONTRIBUTING.md) — layout, dev loop, conventions, PR flow
-3. [`v1/v1.go`](./v1/v1.go) — public `Builder` interface (builds a `raft.Node`)
-4. [`examples/basic/main.go`](./examples/basic/main.go) — minimal call site
+3. [`v3/DEVNOTES.md`](./v3/DEVNOTES.md) — port state, monkey-patch mechanism, traps
+4. [`v3/LIMITATIONS.md`](./v3/LIMITATIONS.md) — behavioral edges + force-new-cluster
+5. [`v3/reflect/init.go`](./v3/reflect/init.go) — the installer entry points
+6. [`examples/basic/main.go`](./examples/basic/main.go) — minimal call site
 
 ## Before you touch anything
 
