@@ -12,8 +12,9 @@
 OpenSSF Scorecard, cosign-signed releases, Dependabot, examples, and an e2e
 harness.
 
-The API is a generic builder: `New[T]()` configures with `With*` methods and
-finalizes with `Build()`.
+The API is a builder around [etcd raft](https://github.com/etcd-io/raft):
+`New()` configures with `With*` methods and finalizes with `Build()`, producing
+a `raft.Node`.
 
 ## Quick Start
 
@@ -31,12 +32,9 @@ import (
 )
 
 func main() {
-	res := libraft.New[string]().
-		WithName("greeting").
-		WithValue("hello world").
-		Build()
+	node := libraft.New().Build()
 
-	fmt.Printf("%s: %s\n", res.Name, res.Value) // greeting: hello world
+	fmt.Printf("node: %v\n", node)
 }
 ```
 
@@ -48,14 +46,14 @@ Three packages, stable/alpha versioning:
 
 ```
 github.com/cnuss/libraft           — root façade. Stable surface (New).
-github.com/cnuss/libraft/v1        — stable Builder[T] interface + Result[T].
+github.com/cnuss/libraft/v1        — stable Builder interface.
 github.com/cnuss/libraft/v1alpha1  — current implementation. May change
                                    between alpha revisions.
 ```
 
-Application code imports the root (`libraft.New[T]()…`). Code that needs to
+Application code imports the root (`libraft.New()…`). Code that needs to
 declare types against the interface imports `v1`. Direct access to the
-`BuilderImpl[T]` struct lives in `v1alpha1`.
+`BuilderImpl` struct lives in `v1alpha1`.
 
 For the file-by-file map, see
 [CONTRIBUTING.md → Where to find things](./CONTRIBUTING.md#where-to-find-things).
@@ -63,20 +61,15 @@ For the file-by-file map, see
 ## API at a glance
 
 ```go
-type Builder[T any] interface {
-    WithName(name string) Builder[T]   // display name carried into the Result
-    WithValue(v T) Builder[T]          // the payload Build produces
-    Build() Result[T]                  // terminal: assembles and returns
-    Name() string                      // configured name (empty if unset)
+type Builder interface {
+    Build() raft.Node   // terminal: assembles and returns the node
 }
 
-type Result[T any] struct {
-    Name  string `json:"name,omitempty"`
-    Value T      `json:"value"`
-}
-
-func New[T any]() Builder[T]   // unconfigured builder
+func New() Builder   // unconfigured builder
 ```
+
+Configuration (`With*` methods) and node assembly land in upcoming revisions;
+until then `Build()` returns nil.
 
 ## Examples
 
@@ -84,14 +77,12 @@ Self-contained programs in [`./examples`](./examples):
 
 | Example | Demonstrates                                          |
 | ------- | ----------------------------------------------------- |
-| `basic` | Smallest wiring — `New` + `WithValue` + `Build`.      |
-| `named` | A typed struct payload carried through `WithValue`.   |
+| `basic` | Smallest wiring — `New` + `Build`.                    |
 
 Run one locally:
 
 ```sh
 make run basic
-make run named
 ```
 
 ## Testing

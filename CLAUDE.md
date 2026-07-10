@@ -8,7 +8,7 @@ agent-specific framing.
 
 1. [README.md](./README.md) — what the library does + public surface
 2. [CONTRIBUTING.md](./CONTRIBUTING.md) — layout, dev loop, conventions, PR flow
-3. [`v1/v1.go`](./v1/v1.go) — public `Builder[T]` interface + `Result[T]`
+3. [`v1/v1.go`](./v1/v1.go) — public `Builder` interface (builds a `raft.Node`)
 4. [`examples/basic/main.go`](./examples/basic/main.go) — minimal call site
 
 ## Before you touch anything

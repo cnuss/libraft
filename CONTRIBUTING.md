@@ -11,9 +11,9 @@ Deep-link by filename; line numbers will drift.
 | Topic                                          | Source                                                           |
 | ---------------------------------------------- | ---------------------------------------------------------------- |
 | Façade (`New`)                                 | [`lib.go`](./lib.go)                                             |
-| Stable interface (`Builder[T]` + `Result[T]`)  | [`v1/v1.go`](./v1/v1.go)                                         |
-| Implementation struct + `New[T]` constructor   | [`v1alpha1/v1alpha1.go`](./v1alpha1/v1alpha1.go)                 |
-| Builder methods (`WithName`, `WithValue`, …)   | [`v1alpha1/builder.go`](./v1alpha1/builder.go)                   |
+| Stable interface (`Builder`)                   | [`v1/v1.go`](./v1/v1.go)                                         |
+| Implementation struct + `New` constructor      | [`v1alpha1/v1alpha1.go`](./v1alpha1/v1alpha1.go)                 |
+| Builder methods (`Build`, …)                   | [`v1alpha1/builder.go`](./v1alpha1/builder.go)                   |
 | Unit tests + fuzz target                       | [`v1alpha1/builder_test.go`](./v1alpha1/builder_test.go)         |
 | godoc examples                                 | [`v1/example_test.go`](./v1/example_test.go)                     |
 | e2e harness + runner                           | [`e2e/e2e_test.go`](./e2e/e2e_test.go)                           |
@@ -32,15 +32,16 @@ Three packages, stable/alpha versioning:
 
 ```
 github.com/cnuss/libraft           — root façade. Stable surface (New).
-github.com/cnuss/libraft/v1        — stable Builder[T] interface + Result[T].
+github.com/cnuss/libraft/v1        — stable Builder interface.
 github.com/cnuss/libraft/v1alpha1  — current implementation. May change
                                    between alpha revisions.
 ```
 
-Application code imports the root (`libraft.New[T]()…`). Code that needs to
+Application code imports the root (`libraft.New()…`). Code that needs to
 declare types against the interface imports `v1`. Direct access to the
-`BuilderImpl[T]` struct lives in `v1alpha1`. The current `Builder[T]` API is a
-generic starting point — swap it for the real one, keeping the layering.
+`BuilderImpl` struct lives in `v1alpha1`. The `Builder` produces a `raft.Node`
+(from `go.etcd.io/raft/v3`); configuration methods and node assembly land in
+upcoming revisions, keeping the layering.
 
 ## Local development
 

@@ -46,7 +46,6 @@ e2e:
 
 # Run an example by name, forwarding any trailing words as args:
 #   make run basic
-#   make run named
 run:
 	cd examples/$(word 2,$(MAKECMDGOALS)) && go run . $(wordlist 3,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
 
