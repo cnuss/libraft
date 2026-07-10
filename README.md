@@ -18,50 +18,67 @@ harness.
 
 It installs into etcd by machine-code monkey-patch — **no edits to etcd
 source** — triggered by a blank import plus the `ETCD_S3LOG_URL` environment
-variable. See [`v3/DEVNOTES.md`](./v3/DEVNOTES.md) for the mechanism and
-[`v3/LIMITATIONS.md`](./v3/LIMITATIONS.md) for the behavioral edges.
+variable. See [The install seam](#the-install-seam) below for the mechanism
+and [`v3/LIMITATIONS.md`](./v3/LIMITATIONS.md) for the behavioral edges.
 
 ## Quick Start
 
 ```sh
-go get github.com/cnuss/libraft/v3
+go get github.com/cnuss/libraft
 ```
 
-Blank-import the installer in the etcd binary's `main`; it patches
-`raft.StartNode`, `raft.RestartNode` and `serverstorage.OpenBackend` at `init`
-when `ETCD_S3LOG_URL` is set (a no-op otherwise):
+Blank-import libraft in the etcd binary's `main` (or any program embedding
+etcd); it patches `raft.StartNode`, `raft.RestartNode` and
+`serverstorage.OpenBackend` at `init` when `ETCD_S3LOG_URL` is set (a no-op
+otherwise):
 
 ```go
 package main
 
 import (
-	_ "github.com/cnuss/libraft/v3/reflect"
+	_ "github.com/cnuss/libraft"
 )
 
 // ... build/run etcd as usual ...
 ```
 
+`ETCD_S3LOG_URL` is the http(s) endpoint of any S3-compatible store, followed
+by the bucket (lowercase) and an optional prefix:
+
 ```sh
-export ETCD_S3LOG_URL=s3://my-bucket/my-prefix   # bucket name must be lowercase
+export ETCD_S3LOG_URL=https://s3.us-east-1.amazonaws.com/my-bucket/my-prefix
 export AWS_ACCESS_KEY_ID=…  AWS_SECRET_ACCESS_KEY=…
 etcd --data-dir /var/lib/etcd
 ```
 
-(Minimal install call site: [`examples/basic/main.go`](./examples/basic/main.go).)
+Or try it locally against MinIO with the bundled example (credentials default
+to `minioadmin`/`minioadmin`):
+
+```sh
+docker run -d -p 9000:9000 minio/minio server /data
+cd examples/basic
+ETCD_S3LOG_URL=http://127.0.0.1:9000/libraft-demo/basic go run .
+```
+
+Run it twice: the second run starts from a brand-new data directory yet reads
+back the first run's value, restored from S3.
 
 ## Layout
 
-Two packages:
+Three packages:
 
 ```
+github.com/cnuss/libraft             — the import seam: blank-import this to
+                                     install s3raft (re-exports EnvURL).
 github.com/cnuss/libraft/v3          — s3raft core: S3 CAS log, raft.Node over
                                      the log, bbolt checkpoint/restore, notify,
                                      batch, metrics.
-github.com/cnuss/libraft/v3/reflect  — the installer: blank-import to monkey-patch
-                                     etcd's raft entry points into the core.
+github.com/cnuss/libraft/v3/reflect  — the installer: monkey-patches etcd's
+                                     raft entry points into the core.
 ```
 
-Hosts blank-import `v3/reflect`; the core exports the seam it calls
+Hosts blank-import the root package (which pulls in `v3/reflect`); the core
+exports the seam the installer calls
 (`Start`, `S3OpenBackend`, `ActiveNS`, `EnvURL`, `Logger`). For the
 file-by-file map, see
 [CONTRIBUTING.md → Where to find things](./CONTRIBUTING.md#where-to-find-things).
@@ -83,13 +100,25 @@ and never collide with the patcher's own text pages. Platform primitives:
 `mach_vm_protect` on darwin, `mprotect` on linux, `VirtualProtect` on windows;
 amd64 and arm64.
 
+## When to use it
+
+s3raft trades write latency for operational simplicity: every write is an S3
+round-trip, so the latency floor is object-store RTT — physics, not tuning.
+That makes it a fit for **low-write control planes** (configuration, service
+discovery, CI locks) that want etcd's API without managing raft quorum, disks,
+and membership. It is not an etcd replacement for kube-apiserver-class write
+loads, and it is a mode with documented semantic differences
+([`v3/LIMITATIONS.md`](./v3/LIMITATIONS.md)) — not a silent drop-in. The CAS
+ordering that makes the shared log safe is modeled in TLA+
+([`v3/tla/`](./v3/tla)).
+
 ## Example
 
 Self-contained program in [`./examples`](./examples):
 
 | Example | Demonstrates                                                |
 | ------- | ---------------------------------------------------------- |
-| `basic` | Blank-import the installer; print the activation env var.  |
+| `basic` | Embedded etcd + the blank import; with `ETCD_S3LOG_URL` set, the raft log lives in S3 and state survives a wiped data dir. |
 
 Run it locally:
 

@@ -10,8 +10,9 @@ Deep-link by filename; line numbers will drift.
 
 | Topic                                          | Source                                                           |
 | ---------------------------------------------- | ---------------------------------------------------------------- |
-| Port state + monkey-patch mechanism            | [`v3/DEVNOTES.md`](./v3/DEVNOTES.md)                             |
+| Monkey-patch mechanism (overview)              | [README → The install seam](./README.md#the-install-seam)        |
 | Behavioral limits + force-new-cluster          | [`v3/LIMITATIONS.md`](./v3/LIMITATIONS.md)                       |
+| TLA+ model of the CAS log ordering             | [`v3/tla/`](./v3/tla)                                            |
 | Installer (`init`, `s3StartNode`, `patchFunc`) | [`v3/reflect/init.go`](./v3/reflect/init.go)                     |
 | Platform patch primitives                      | [`v3/reflect/init_darwin.go`](./v3/reflect/init_darwin.go), [`init_windows.go`](./v3/reflect/init_windows.go), [`init_other.go`](./v3/reflect/init_other.go) |
 | S3 CAS client                                  | [`v3/client.go`](./v3/client.go)                                 |
@@ -30,26 +31,44 @@ Deep-link by filename; line numbers will drift.
 
 ## Module layout
 
-Two packages:
+Three packages:
 
 ```
+github.com/cnuss/libraft             — the import seam: blank-import this to
+                                     install s3raft (re-exports EnvURL).
 github.com/cnuss/libraft/v3          — s3raft core: S3 CAS log, raft.Node over
                                      the log, bbolt checkpoint/restore, notify,
                                      batch, metrics.
-github.com/cnuss/libraft/v3/reflect  — the installer: blank-import to monkey-patch
-                                     etcd's raft entry points into the core.
+github.com/cnuss/libraft/v3/reflect  — the installer: monkey-patches etcd's
+                                     raft entry points into the core.
 ```
 
-A host blank-imports `v3/reflect`; its `init` (when `ETCD_S3LOG_URL` is set)
-rewrites the prologue of `raft.StartNode`, `raft.RestartNode` and
-`serverstorage.OpenBackend` to jump into the core. The core exports the seam
-the installer calls: `Start`, `S3OpenBackend`, `ActiveNS`, `EnvURL`, `Logger`.
-The monkey-patch is intentional and load-bearing — see
-[`v3/DEVNOTES.md`](./v3/DEVNOTES.md); never replace it with a source edit.
+A host blank-imports the root package (which pulls in `v3/reflect`); the
+installer's `init` (when `ETCD_S3LOG_URL` is set) rewrites the prologue of
+`raft.StartNode`, `raft.RestartNode` and `serverstorage.OpenBackend` to jump
+into the core. The core exports the seam the installer calls: `Start`,
+`S3OpenBackend`, `ActiveNS`, `EnvURL`, `Logger`. The monkey-patch is
+intentional and load-bearing — never replace it with a source edit (see the
+patch-target rules under Conventions that bite).
+
+## Provenance
+
+The `v3` core was ported out of an etcd fork — `server/etcdserver/s3raft/*` at
+commit `0ab3790793d54f7709d9c9b62175d200aadb483e` (2026-07-09) — and split into
+the core/installer layout here on 2026-07-10. It was a **copy, not a move**:
+that etcd tree still carries its own flat `s3raft` package (installer files
+inline) plus an e2e harness that builds `bin/etcd` with the blank import and
+drives it against a real bucket. If libraft becomes the source of truth,
+delete the etcd copy and have that tree blank-import
+`github.com/cnuss/libraft/v3/reflect`; the bucket-backed e2e harness should
+migrate into a `tests/` tree here (see Roadmap).
 
 ## Local development
 
-Requires Go 1.26 or later (pinned by `go.etcd.io/etcd/server/v3`).
+Requires Go 1.26 or later (pinned by `go.etcd.io/etcd/server/v3`, which also
+drags a heavy dependency tree — bbolt, grpc, otel. Expect version-alignment
+churn between this `go.mod` and etcd's on bumps; run `go mod tidy` and
+reconcile deliberately).
 
 ```sh
 git clone https://github.com/cnuss/libraft.git
@@ -98,7 +117,27 @@ Easy to get wrong from the diff alone:
   function prologue — a legitimate monkey-patch that `vet`'s `unsafeptr`
   analyzer flags as misuse. The Makefile's `vet` and `windows` targets disable
   that one analyzer; keep it off, don't rewrite the patcher to appease it (the
-  mechanism is load-bearing — see [`v3/DEVNOTES.md`](./v3/DEVNOTES.md)).
+  mechanism is load-bearing).
+- **Only patch exported entry points in far modules** (`go.etcd.io/raft`,
+  `server/v3/storage`) — never a symbol inside `etcdserver`, however
+  convenient. Patching `bootstrappedRaft.newRaftNode` was tried and reverted
+  (2026-07-10): the patcher is linked into the same binary at an uncontrolled
+  offset, so the target's 16 KB text page can contain the patcher's own
+  helpers (`flushICache`/`setExecutable`/trampolines) depending on link
+  layout — which varies between builds. Making that page writable de-executes
+  the running patcher mid-patch → SIGBUS that smoke tests miss and e2e hits.
+  Moving the patcher into its own package does NOT fix this (same binary, same
+  uncontrolled layout); far-module targets are pages away and never collide.
+  If the etcd cluster ID is ever wanted for namespacing, derive it inside the
+  already-safe `S3OpenBackend` seam (from `ServerConfig`/WAL metadata), or
+  first build a robust patcher that writes through a separate RW alias
+  (`mach_vm_remap`) — do not reintroduce an in-`etcdserver` patch.
+- **Verify a patch actually lands** when touching the installer or its
+  targets — inlining and same-page traps are silent:
+  ```sh
+  go tool nm bin/etcd | grep <symbol>      # link addresses
+  go tool objdump bin/etcd -s <symbol>     # confirm not inlined away
+  ```
 - **The patcher is platform- and arch-specific.** `//go:build` tags partition
   `init_darwin.go` (mach_vm_protect) / `init_windows.go` (VirtualProtect) /
   `init_other.go` (mprotect); amd64 + arm64. Adding a platform means adding a
@@ -123,6 +162,51 @@ example is copy-pasteable on its own).
 Print a single recognizable line so the e2e harness can assert on it, then add
 a row to the `cases` table in `e2e/e2e_test.go` (name + expected substring) and
 to the README's example table.
+
+## Roadmap & known gaps
+
+Reconciled 2026-07-10. The landed work (fencing epochs, lessor fencing,
+snapshot→bucket + log truncation, batching, SQS notification, 429/503 backoff,
+force-new-cluster) makes s3raft credible for low-write control planes (see
+[README → When to use it](./README.md#when-to-use-it)); these gaps are what's
+left:
+
+1. **Sealed writes / integrity** — no per-entry checksum, and no cluster-ID
+   stamp / bucket-mismatch guard. The namespace key is a proxy —
+   `root|InitialClusterToken|minPeerURL` (`nsFromConfig`, checkpoint.go) — not
+   the etcd cluster ID, so two different clusters aimed at the same
+   bucket/prefix are not hard-fenced. Fix: derive the real cluster ID inside
+   the `S3OpenBackend` seam and stamp it into `meta/` (see the patch-target
+   rule above for why not via a new patch).
+2. **Multipart uploads** — snapshots and entries >5 MB use a single PUT; real
+   S3 needs multipart. Related: request-pricing telemetry, IAM-scoped creds,
+   TLS review.
+3. **Config surface** — `ETCD_S3LOG_URL` env var only; wants a proper
+   `--experimental-s3-log-url` flag + feature gate per etcd conventions, and
+   the bucket-backed e2e harness moved from the etcd fork into a `tests/`
+   tree here.
+4. **Concurrency correctness pass** — Jepsen-style: `kill -9` loops,
+   partitioned S3 access, clock skew; validate no lost/duplicated acks. The
+   CAS core should survive; leases are the risk.
+5. **ETag-chain heal, general case** — reconcile heal-tail exists for
+   force-new; confirm a writer crash between the HEAD CAS and the `log/N`
+   write backfills for a reader-only node without a stall (node.go reconcile
+   path).
+6. **Membership semantics** — add/remove-member untested; rejoin-after-wipe
+   needs `--initial-cluster-state existing` (a lone node with `existing` tries
+   to fetch cluster info and dies). Behavioral edges in
+   [`v3/LIMITATIONS.md`](./v3/LIMITATIONS.md).
+7. **`ActiveNS` cross-package global** — `S3OpenBackend` sets it, the
+   installer reads it. Safe today (OpenBackend always runs before StartNode,
+   single-threaded at boot); make it an explicit parameter if the seam grows.
+8. **Housekeeping** — `node.go` (~1300 lines) wants splitting (run loop /
+   reconcile / force-new); extract sigv4 signing from `client.go`;
+   `checkpoint.go` mixes backend-open, namespace derivation, checkpoint and
+   guards; `package reflect` shadows the stdlib package it imports (a rename
+   breaks the import path — decide before tagging v3); the boot logger is
+   double-named `s3raft.s3raft`; `proto.Uint64` → `new()`, `sort.Slice` →
+   `slices.Sort`; scope the vet `-unsafeptr` exception to `v3/reflect` instead
+   of tree-wide.
 
 ## Branch / PR flow
 
