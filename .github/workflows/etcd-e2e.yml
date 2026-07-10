@@ -94,6 +94,39 @@ jobs:
             sleep 1
           done
 
+      # Isolate hijack startup from the e2e framework: run the hijacked binary
+      # standalone with minimal single-node args and capture its FULL output.
+      # Also dump the addresses of the patch target and the patcher — if they
+      # land on the same page the monkey-patch SIGBUSes (the hazard that got the
+      # newRaftNode seam reverted once; this full etcd binary is where it bit).
+      - name: smoke — hijacked etcd standalone (reflect only)
+        if: matrix.mode == 'reflect'
+        continue-on-error: true
+        env:
+          ETCD_S3LOG_URL: http://127.0.0.1:9000/etcd-smoke
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+        run: |
+          echo "== symbol gap (same-page SIGBUS hazard) =="
+          go tool nm "$GITHUB_WORKSPACE/etcd/bin/etcd" \
+            | grep -E 'bootstrappedRaft\)\.newRaftNode$|reflect\.writeText$|v3\.NewRaftNode$' || echo "(symbols not found)"
+          echo "== launch standalone =="
+          D=$(mktemp -d)
+          "$GITHUB_WORKSPACE/etcd/bin/etcd" --data-dir "$D" --name smoke \
+            --listen-client-urls http://127.0.0.1:23790 --advertise-client-urls http://127.0.0.1:23790 \
+            --listen-peer-urls http://127.0.0.1:23791 --initial-advertise-peer-urls http://127.0.0.1:23791 \
+            --initial-cluster smoke=http://127.0.0.1:23791 --initial-cluster-state new \
+            > "$GITHUB_WORKSPACE/smoke.log" 2>&1 &
+          PID=$!
+          for i in $(seq 1 25); do
+            if grep -q "ready to serve client requests" "$GITHUB_WORKSPACE/smoke.log"; then echo "READY"; break; fi
+            if ! kill -0 $PID 2>/dev/null; then echo "PROCESS EXITED EARLY (code $?)"; break; fi
+            sleep 1
+          done
+          kill $PID 2>/dev/null || true
+          echo "== smoke.log (full) =="
+          cat "$GITHUB_WORKSPACE/smoke.log"
+
       - name: run etcd e2e subset (${{ matrix.mode }})
         id: e2e
         continue-on-error: ${{ matrix.mode == 'reflect' }}
@@ -104,6 +137,9 @@ jobs:
           ETCD_S3LOG_URL: ${{ matrix.mode == 'reflect' && 'http://127.0.0.1:9000/etcd-e2e' || '' }}
           AWS_ACCESS_KEY_ID: ${{ matrix.mode == 'reflect' && 'minioadmin' || '' }}
           AWS_SECRET_ACCESS_KEY: ${{ matrix.mode == 'reflect' && 'minioadmin' || '' }}
+          # Make the e2e framework print each etcd process's full output, so a
+          # startup crash under the hijack shows its panic, not a truncated tail.
+          EXPECT_DEBUG: ${{ matrix.mode == 'reflect' && '1' || '' }}
         run: |
           echo "mode=${{ matrix.mode }}  subset=${E2E_SUBSET}"
           go test ./e2e -run "${E2E_SUBSET}" -count=1 -v -timeout 20m 2>&1 | tee "$GITHUB_WORKSPACE/e2e-${{ matrix.mode }}.log"
@@ -123,5 +159,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: e2e-${{ matrix.mode }}-logs
-          path: e2e-${{ matrix.mode }}.log
+          path: |
+            e2e-${{ matrix.mode }}.log
+            smoke.log
           if-no-files-found: warn
