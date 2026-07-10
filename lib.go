@@ -22,3 +22,19 @@ import (
 // optional prefix, e.g. https://s3.us-east-1.amazonaws.com/my-bucket/my-prefix
 // (bucket names must be lowercase).
 const EnvURL = v3.EnvURL
+
+// The types below re-export the s3raft node-construction mirrors from the core.
+// They are byte-for-byte layout copies of etcd's unexported raft structs that
+// the installer patches into place (see [github.com/cnuss/libraft/v3.NewRaftNode]);
+// their fields are deliberately unexported because only the memory layout is an
+// API, not the fields.
+type (
+	// BootstrappedRaft mirrors etcd's (*bootstrappedRaft) receiver.
+	BootstrappedRaft = v3.BootstrappedRaft
+	// RaftNodeConfig mirrors etcd's raftNodeConfig.
+	RaftNodeConfig = v3.RaftNodeConfig
+	// ToApply mirrors etcd's toApply.
+	ToApply = v3.ToApply
+	// RaftNode mirrors etcd's raftNode, the value NewRaftNode returns.
+	RaftNode = v3.RaftNode
+)

@@ -15,6 +15,7 @@ Deep-link by filename; line numbers will drift.
 | TLA+ model of the CAS log ordering             | [`v3/tla/`](./v3/tla)                                            |
 | Installer (`init`, `patchFunc`, linkname target) | [`v3/reflect/init.go`](./v3/reflect/init.go), [`v3/reflect/newraftnode.go`](./v3/reflect/newraftnode.go) |
 | `NewRaftNode` replacement + layout mirrors     | [`v3/newraftnode.go`](./v3/newraftnode.go)                       |
+| Layout guard (mirror vs imported etcd)         | [`v3/reflect/init_test.go`](./v3/reflect/init_test.go)           |
 | Platform patch primitives                      | [`v3/reflect/init_darwin.go`](./v3/reflect/init_darwin.go), [`init_windows.go`](./v3/reflect/init_windows.go), [`init_other.go`](./v3/reflect/init_other.go) |
 | S3 CAS client                                  | [`v3/client.go`](./v3/client.go)                                 |
 | raft.Node over the S3 log + `Start`            | [`v3/node.go`](./v3/node.go)                                     |
@@ -142,11 +143,16 @@ Easy to get wrong from the diff alone:
     through a separate RW alias (`mach_vm_remap`) so the executing mapping never
     loses execute — eliminating the whole same-page class. Don't paper over a
     collision by relocating code and hoping.
-- **The layout mirrors in `v3/newraftnode.go` are pinned to a specific etcd
-  version** (v3.7.0). They reconstruct etcd's unexported `raftNode` /
-  `raftNodeConfig` / `bootstrappedRaft` by field-for-field memory layout; a
-  plain field reorder or addition upstream silently corrupts state. Re-check
-  the mirrors against `etcdserver/raft.go` + `bootstrap.go` on every etcd bump.
+- **The layout mirrors in `v3/newraftnode.go` reconstruct etcd's unexported
+  `raftNode` / `raftNodeConfig` / `toApply` / `bootstrappedRaft` by
+  field-for-field memory layout**; a plain field reorder or addition upstream
+  silently corrupts state. `v3/reflect/init_test.go` guards this: it reflects
+  etcd's *actually imported* `raftNode` (via the `EtcdServer.r` field) and
+  asserts the mirror matches offset-for-offset, so an etcd bump that shifts the
+  layout fails `make test` instead of corrupting at runtime. `bootstrappedRaft`
+  has no exported reflect anchor, so its size + read-field offsets are pinned by
+  hand in the same test — update those against `etcdserver/bootstrap.go` when
+  the pin trips, then re-verify end-to-end.
 - **`//go:linkname` reaches the target's address across the module boundary.**
   It needs `import _ "unsafe"` and a blank import of `etcdserver` so the symbol
   is linked (see `v3/reflect/newraftnode.go`). The linkname'd handle is never

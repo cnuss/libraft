@@ -37,7 +37,14 @@ import (
 // Field order and types MUST match etcdserver/raft.go + bootstrap.go exactly;
 // etcd reads these at compile-time offsets from its own definitions.
 
-type bootstrappedRaft struct {
+// The types below are exported so callers can name them, but their fields stay
+// unexported on purpose: they are byte-for-byte layout mirrors of etcd's
+// unexported structs, not a construction API — only the field order and types
+// matter (etcd reads them at its own compile-time offsets). Field NAMES and
+// exportedness are irrelevant to the layout, so keeping fields private prevents
+// them from being mistaken for a stable, settable surface.
+
+type BootstrappedRaft struct {
 	lg        *zap.Logger
 	heartbeat time.Duration
 	peers     []raft.Peer
@@ -45,7 +52,7 @@ type bootstrappedRaft struct {
 	storage   *raft.MemoryStorage
 }
 
-type raftNodeConfig struct {
+type RaftNodeConfig struct {
 	lg          *zap.Logger
 	isIDRemoved func(id uint64) bool
 	raft.Node
@@ -55,20 +62,20 @@ type raftNodeConfig struct {
 	transport   rafthttp.Transporter
 }
 
-type toApply struct {
+type ToApply struct {
 	entries       []*raftpb.Entry
 	snapshot      *raftpb.Snapshot
 	notifyc       chan struct{}
 	raftAdvancedC <-chan struct{}
 }
 
-type raftNode struct {
+type RaftNode struct {
 	lg           *zap.Logger
 	tickMu       *sync.RWMutex
 	latestTickTs time.Time
-	raftNodeConfig
+	RaftNodeConfig
 	msgSnapC   chan *raftpb.Message
-	applyc     chan toApply
+	applyc     chan ToApply
 	readStateC chan raft.ReadState
 	ticker     *time.Ticker
 	td         *contention.TimeoutDetector
@@ -78,7 +85,7 @@ type raftNode struct {
 
 const maxInFlightMsgSnap = 16
 
-// NewRaftNode replaces (*bootstrappedRaft).newRaftNode. It mirrors etcd's body
+// NewRaftNode replaces etcd's (*bootstrappedRaft).newRaftNode. It mirrors its body
 // but builds the raft.Node from the S3 log via Start (instead of
 // raft.StartNode/RestartNode). The arguments arrive as opaque pointer words so
 // the signature is expressible without etcd's unexported types; the real ABI is
@@ -86,7 +93,7 @@ const maxInFlightMsgSnap = 16
 // layout lines up. This call site — unlike the raft.StartNode seam — carries the
 // *membership.RaftCluster, whose ID() is the etcd cluster ID.
 func NewRaftNode(bp, ssp, walp, clp unsafe.Pointer) unsafe.Pointer {
-	b := (*bootstrappedRaft)(bp)
+	b := (*BootstrappedRaft)(bp)
 	ss := (*snap.Snapshotter)(ssp)
 	w := (*wal.WAL)(walp)
 	cl := (*membership.RaftCluster)(clp)
@@ -102,11 +109,11 @@ func NewRaftNode(bp, ssp, walp, clp unsafe.Pointer) unsafe.Pointer {
 		panic(fmt.Sprintf("s3raft: start: %v", err))
 	}
 
-	r := &raftNode{
+	r := &RaftNode{
 		lg:           b.lg,
 		tickMu:       new(sync.RWMutex),
 		latestTickTs: time.Now(),
-		raftNodeConfig: raftNodeConfig{
+		RaftNodeConfig: RaftNodeConfig{
 			lg:          b.lg,
 			isIDRemoved: func(id uint64) bool { return cl.IsIDRemoved(types.ID(id)) },
 			Node:        n,
@@ -116,7 +123,7 @@ func NewRaftNode(bp, ssp, walp, clp unsafe.Pointer) unsafe.Pointer {
 		},
 		readStateC: make(chan raft.ReadState, 1),
 		msgSnapC:   make(chan *raftpb.Message, maxInFlightMsgSnap),
-		applyc:     make(chan toApply),
+		applyc:     make(chan ToApply),
 		stopped:    make(chan struct{}),
 		done:       make(chan struct{}),
 	}
