@@ -1,0 +1,127 @@
+# Runs a subset of etcd's OWN e2e suite against two binaries and compares:
+#
+#   baseline — stock etcd (built from the pinned etcd checkout), no hijack.
+#   reflect  — stock etcd + the s3raft installer blank-imported
+#              (tests/e2e-etcd), ETCD_S3LOG_URL pointed at a MinIO container.
+#
+# The hijacked binary is stock etcd with one blank import (etcdmain.Main is
+# exported), built in an isolated module so etcdmain's deps never touch the
+# root go.mod. etcd's e2e framework resolves the server binary from
+# <etcd>/bin/etcd, so the reflect leg just overwrites that one file.
+#
+# s3raft documents whole classes of e2e as unsupported (multi-member reconfig
+# races, periodic corruption check, discovery, force-new), so the reflect leg
+# is EXPECTED to diverge and is non-blocking (continue-on-error) — the value is
+# the baseline-vs-reflect diff in the logs, not all-green. Baseline is required:
+# it proves the harness itself works. Expand E2E_SUBSET as more of the suite is
+# shown to hold under the hijack (see issue #20).
+
+name: etcd-e2e
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - "v3/**"
+      - "tests/e2e-etcd/**"
+      - ".github/workflows/etcd-e2e.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # etcd release the hijack + this harness are pinned to (must match the
+  # go.etcd.io/etcd/server/v3 version in go.mod / tests/e2e-etcd/go.mod).
+  ETCD_REF: v3.7.0
+  # Single-node KV/ctl tests to start from. Deliberately small; grow as the
+  # reflect leg is shown to pass more (issue #20).
+  E2E_SUBSET: "TestCtlV3Put|TestCtlV3Get|TestCtlV3Del"
+
+jobs:
+  e2e:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [baseline, reflect]
+    steps:
+      - name: checkout libraft
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: libraft
+
+      - name: checkout etcd ${{ env.ETCD_REF }}
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: etcd-io/etcd
+          ref: ${{ env.ETCD_REF }}
+          path: etcd
+
+      - name: setup go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: etcd/go.mod
+
+      - name: build stock etcd binaries
+        working-directory: etcd
+        run: |
+          make build
+          ls -l bin/
+          ./bin/etcd --version
+
+      - name: build hijacked etcd (reflect only)
+        if: matrix.mode == 'reflect'
+        working-directory: libraft/tests/e2e-etcd
+        run: |
+          # Overwrite ONLY the server binary; etcdctl/etcdutl stay stock.
+          CGO_ENABLED=0 go build -o "$GITHUB_WORKSPACE/etcd/bin/etcd" .
+          "$GITHUB_WORKSPACE/etcd/bin/etcd" --version
+
+      - name: start MinIO (reflect only)
+        if: matrix.mode == 'reflect'
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+          # Wait for readiness.
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:9000/minio/health/live; then echo ready; break; fi
+            sleep 1
+          done
+
+      - name: run etcd e2e subset (${{ matrix.mode }})
+        id: e2e
+        continue-on-error: ${{ matrix.mode == 'reflect' }}
+        working-directory: etcd/tests
+        env:
+          # Only set for the reflect leg; the spawned etcd inherits this env, so
+          # the installer activates. Unset (baseline) => the installer no-ops.
+          ETCD_S3LOG_URL: ${{ matrix.mode == 'reflect' && 'http://127.0.0.1:9000/etcd-e2e' || '' }}
+          AWS_ACCESS_KEY_ID: ${{ matrix.mode == 'reflect' && 'minioadmin' || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ matrix.mode == 'reflect' && 'minioadmin' || '' }}
+        run: |
+          echo "mode=${{ matrix.mode }}  subset=${E2E_SUBSET}"
+          go test ./e2e -run "${E2E_SUBSET}" -count=1 -v -timeout 20m 2>&1 | tee "$GITHUB_WORKSPACE/e2e-${{ matrix.mode }}.log"
+
+      - name: summarize
+        if: always()
+        run: |
+          echo "### etcd-e2e (${{ matrix.mode }})" >> "$GITHUB_STEP_SUMMARY"
+          echo "outcome: ${{ steps.e2e.outcome }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E '^(=== RUN|--- (PASS|FAIL|SKIP)|PASS|FAIL|ok |panic)' \
+            "$GITHUB_WORKSPACE/e2e-${{ matrix.mode }}.log" 2>/dev/null | tail -80 >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: upload logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: e2e-${{ matrix.mode }}-logs
+          path: e2e-${{ matrix.mode }}.log
+          if-no-files-found: warn
