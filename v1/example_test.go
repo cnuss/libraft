@@ -1,20 +1,24 @@
 package v1_test
 
 import (
+	"context"
 	"fmt"
-	"log/slog"
 
 	"github.com/cnuss/libraft"
 )
 
 // New returns an unconfigured Builder; configure it with the With* methods and
-// finalize with Build. Node assembly is not implemented yet, so Build returns
-// a nil raft.Node for now.
+// finalize with the terminal Node. The returned Node carries the assembled
+// config; the underlying raft node starts when WithPeers or WithoutPeers is
+// called on it.
 func ExampleNew() {
 	node := libraft.New().
-		WithLog(slog.Default()).
-		Build()
+		WithContext(context.Background()).
+		WithID(1).
+		WithElectionTick(10).
+		WithHeartbeatTick(1).
+		Node()
 
-	fmt.Println(node == nil)
+	fmt.Println(node != nil)
 	// Output: true
 }

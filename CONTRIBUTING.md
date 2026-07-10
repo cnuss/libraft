@@ -12,8 +12,9 @@ Deep-link by filename; line numbers will drift.
 | ---------------------------------------------- | ---------------------------------------------------------------- |
 | Façade (`New`)                                 | [`lib.go`](./lib.go)                                             |
 | Stable interface (`Builder`)                   | [`v1/v1.go`](./v1/v1.go)                                         |
-| Implementation struct + `New` constructor      | [`v1alpha1/v1alpha1.go`](./v1alpha1/v1alpha1.go)                 |
-| Builder methods (`Build`, …)                   | [`v1alpha1/builder.go`](./v1alpha1/builder.go)                   |
+| Implementation structs + `NewBuilder`          | [`v1alpha1/v1alpha1.go`](./v1alpha1/v1alpha1.go)                 |
+| Builder methods (`With*`, terminal `Node`)     | [`v1alpha1/builder.go`](./v1alpha1/builder.go)                   |
+| Node methods (`WithPeers`, `WithoutPeers`)     | [`v1alpha1/node.go`](./v1alpha1/node.go)                         |
 | Unit tests + fuzz target                       | [`v1alpha1/builder_test.go`](./v1alpha1/builder_test.go)         |
 | godoc examples                                 | [`v1/example_test.go`](./v1/example_test.go)                     |
 | e2e harness + runner                           | [`e2e/e2e_test.go`](./e2e/e2e_test.go)                           |

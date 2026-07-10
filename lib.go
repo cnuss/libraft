@@ -11,7 +11,7 @@
 //     you need direct access to the struct.
 //
 // New() returns a Builder you configure with With* methods and finalize with
-// Build(), producing a raft.Node.
+// the terminal Node(), producing a v1.Node.
 package libraft
 
 import (
@@ -20,7 +20,7 @@ import (
 )
 
 // New returns an unconfigured Builder. Configure it with the With* methods,
-// then call Build to produce the raft.Node.
+// then call the terminal Node to produce the node.
 func New() v1.Builder {
-	return v1alpha1.New()
+	return v1alpha1.NewBuilder()
 }

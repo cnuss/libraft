@@ -65,7 +65,7 @@ func TestExamples(t *testing.T) {
 		name string
 		want string
 	}{
-		{"basic", "node: <nil>"},
+		{"basic", "node: *v1alpha1.NodeImpl"},
 	}
 	for _, tc := range cases {
 		tc := tc

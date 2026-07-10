@@ -13,8 +13,8 @@ OpenSSF Scorecard, cosign-signed releases, Dependabot, examples, and an e2e
 harness.
 
 The API is a builder around [etcd raft](https://github.com/etcd-io/raft):
-`New()` configures with `With*` methods and finalizes with `Build()`, producing
-a `raft.Node`.
+`New()` configures with `With*` methods and finalizes with the terminal
+`Node()`, producing a `Node` (a wrapper around `raft.Node`).
 
 ## Quick Start
 
@@ -32,9 +32,9 @@ import (
 )
 
 func main() {
-	node := libraft.New().Build()
+	node := libraft.New().Node()
 
-	fmt.Printf("node: %v\n", node)
+	fmt.Printf("node: %T\n", node)
 }
 ```
 
@@ -62,15 +62,33 @@ For the file-by-file map, see
 
 ```go
 type Builder interface {
-    WithLog(logger *slog.Logger) Builder   // logger the node logs through
-    Build() raft.Node                      // terminal: assembles and returns the node
+    WithContext(ctx context.Context) Builder   // ties the builder's lifetime to ctx
+
+    // one chainable setter per raft.Config field; see v1/v1.go for the full set
+    WithID(id uint64) Builder
+    WithElectionTick(ticks int) Builder
+    WithHeartbeatTick(ticks int) Builder
+    WithStorage(storage raft.Storage) Builder
+    WithLogger(logger raft.Logger) Builder
+    // …
+
+    Node() Node                                // terminal: assembles and returns the node
+}
+
+type Node interface {
+    raft.Node   // wraps the upstream interface so the surface can grow
+
+    WithPeers(peers []raft.Peer) Node   // start: bootstrap a new cluster from peers
+    WithoutPeers() Node                 // restart: recover peers from storage
 }
 
 func New() Builder   // unconfigured builder
 ```
 
-Node assembly (and further `With*` configuration) lands in upcoming revisions;
-until then `Build()` returns nil.
+The terminal `Node()` carries the assembled config; the underlying raft node
+starts when `WithPeers` (bootstrap, `raft.StartNode`) or `WithoutPeers`
+(restart from storage, `raft.RestartNode`) is called on it, and stops when the
+context given via `WithContext` is done.
 
 ## Examples
 
@@ -78,7 +96,7 @@ Self-contained programs in [`./examples`](./examples):
 
 | Example | Demonstrates                                          |
 | ------- | ----------------------------------------------------- |
-| `basic` | Smallest wiring — `New` + `Build`.                    |
+| `basic` | Smallest wiring — `New` + terminal `Node`.            |
 
 Run one locally:
 

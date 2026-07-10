@@ -1,4 +1,4 @@
-// Command basic is the smallest libraft example: build a raft.Node through the
+// Command basic is the smallest libraft example: build a Node through the
 // builder and print the result.
 package main
 
@@ -9,7 +9,7 @@ import (
 )
 
 func main() {
-	node := libraft.New().Build()
+	node := libraft.New().Node()
 
-	fmt.Printf("node: %v\n", node)
+	fmt.Printf("node: %T\n", node)
 }
