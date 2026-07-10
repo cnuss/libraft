@@ -83,12 +83,18 @@ func patchFunc(from, to uintptr) {
 func jumpTo(addr uintptr) []byte {
 	switch runtime.GOARCH {
 	case "amd64":
-		// MOVABS RAX, addr ; JMP RAX
+		// JMP [RIP+0] ; .quad addr — an absolute indirect jump through the
+		// address stored immediately after the instruction. This clobbers NO
+		// registers, which is essential: Go's internal ABI passes the first
+		// integer arguments in RAX, RBX, RCX, RDI, ... so a `MOVABS RAX, addr;
+		// JMP RAX` trampoline (the obvious form) would destroy the callee's
+		// first argument (a method receiver lands in RAX) before it is read —
+		// a nil-deref crash on amd64 that a scratch-register arm64 branch hides.
 		b := []byte{
-			0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, // mov rax, imm64
-			0xFF, 0xE0, // jmp rax
+			0xFF, 0x25, 0x00, 0x00, 0x00, 0x00, // jmp qword ptr [rip+0]
+			0, 0, 0, 0, 0, 0, 0, 0, // .quad addr
 		}
-		putUint64(b[2:10], uint64(addr))
+		putUint64(b[6:14], uint64(addr))
 		return b
 	case "arm64":
 		// LDR X17, #8 ; BR X17 ; .quad addr
