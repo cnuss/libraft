@@ -9,19 +9,28 @@
 # root go.mod. etcd's e2e framework resolves the server binary from
 # <etcd>/bin/etcd, so the reflect leg just overwrites that one file.
 #
-# A test failure fails the step (pipefail + no continue-on-error). s3raft
-# documents whole classes of e2e as unsupported (multi-member reconfig races,
-# periodic corruption check, discovery, force-new), so on the FULL suite the
-# reflect leg is red by design — scope E2E_SUBSET to the single-node subset
-# that holds under the hijack to get a green gate. Baseline proves the harness
-# itself works. The baseline-vs-reflect diff in the logs is the map of what
-# s3raft supports (see issue #20).
+# A test failure fails the step (pipefail + no continue-on-error). Both legs
+# run the E2E_SUBSET below — the slice of etcd's own suite s3raft is known to
+# pass (single-node + a real multi-member cluster), so both gate green.
+# s3raft documents whole classes of e2e as unsupported (leader transfer,
+# simultaneous discovery bootstrap, periodic corruption check, force-new);
+# those are excluded from the subset and only run when E2E_SUBSET is cleared
+# for a manual full-surface mapping. Baseline proves the harness itself works;
+# the baseline-vs-reflect diff is the map of what s3raft supports (issue #20).
 
 name: etcd-e2e
 
 on:
   workflow_dispatch:
   pull_request:
+    branches: [main]
+    paths:
+      - "v3/**"
+      - "tests/e2e-etcd/**"
+      - ".github/workflows/etcd-e2e.yml"
+  # main re-runs the same subset post-merge, guarding against drift landing on
+  # the default branch (both PR and push use the E2E_SUBSET gate below).
+  push:
     branches: [main]
     paths:
       - "v3/**"
@@ -39,11 +48,22 @@ env:
   # etcd release the hijack + this harness are pinned to (must match the
   # go.etcd.io/etcd/server/v3 version in go.mod / tests/e2e-etcd/go.mod).
   ETCD_REF: v3.7.0
-  # Empty = run etcd's ENTIRE e2e suite (no -run filter) to map the full
-  # surface of what s3raft does and does not support. Set a regex to scope it.
-  # Both legs are non-blocking here; the deliverable is the baseline-vs-reflect
-  # failure diff in the logs, not a green gate.
-  E2E_SUBSET: ""
+  # Both PRs and main run the SAME fast, high-value subset of etcd's OWN suite
+  # that s3raft is known to pass (confirmed against the full run in issue #20) —
+  # enough to prove a CLUSTER stays functional through the S3 log, not just a
+  # single node:
+  #   single-node functional: KV, txn, lease, watch, compaction, auth, elect, lock
+  #   multi-member:           multi-peer bring-up, member add/list/update/promote,
+  #                           learners, linearizable + consistent reads,
+  #                           runtime grow/shrink of the cluster
+  # Deliberately EXCLUDED (red-by-design under the hijack, per LIMITATIONS.md):
+  # leader transfer, simultaneous discovery bootstrap, network-partition health,
+  # the periodic corruption check, rolling upgrade. To re-map the full surface,
+  # clear this value (E2E_SUBSET="") on a manual workflow_dispatch run.
+  # Regex must be shell-safe (no spaces or parens; spliced unquoted into -run).
+  # NOTE: TestRuntimeReconfig is listed as the two passing variants explicitly
+  # because bare `TestRuntimeReconfig` would also match RollingUpgrade (fails).
+  E2E_SUBSET: "TestCtlV3Put|TestCtlV3Get|TestCtlV3Del|TestCtlV3Txn|TestCtlV3Lease|TestCtlV3Watch|TestCtlV3Compact|TestCtlV3Auth|TestCtlV3Elect|TestCtlV3Lock|TestCtlV3Member|TestCtlV3LinearizableRead|TestCtlV3ConsistentMemberList|TestEtcdMultiPeer|TestRuntimeReconfigGrowClusterSize|TestRuntimeReconfigDecreaseClusterSize"
 
 jobs:
   e2e:
@@ -134,10 +154,9 @@ jobs:
         id: e2e
         # A test failure fails this step (and the job): pipefail propagates
         # go test's exit code through the tee, and there is no continue-on-error
-        # masking it. NOTE: on the full suite (E2E_SUBSET="") the reflect leg
-        # fails ~28 documented-unsupported tests, so reflect will be red until
-        # E2E_SUBSET is scoped back to the single-node subset that holds under
-        # the hijack.
+        # masking it. The default E2E_SUBSET is the known-passing slice, so the
+        # gate is green; clearing it (manual full run) turns the reflect leg red
+        # on the ~28 documented-unsupported tests.
         working-directory: etcd/tests
         env:
           # etcd's own scripts/test.sh exports ETCD_VERIFY=all for every e2e
