@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -85,7 +86,17 @@ type node struct {
 	pendingReads   []raft.ReadState
 	pendingSoft    *raft.SoftState   // leadership announcement for the next Ready
 	pendingMsgs    []*raftpb.Message // heartbeats to hand out via Ready.Messages
-	voters         map[uint64]struct{}
+
+	// voters and maxTerm are written only on the run goroutine, but the
+	// checkpointer goroutine (runCheckpointer -> pruneProgress/uploadSnapshot)
+	// reads them concurrently. membMu guards those writes against the
+	// checkpointer's reads: an unsynchronized map read racing applyConf's write
+	// is a fatal "concurrent map read and map write" that crashes the process.
+	// Run-goroutine reads stay lockless (ordered against the writes by being on
+	// the same goroutine); only the run-side writes take Lock and the off-run
+	// checkpointer reads take RLock.
+	membMu sync.RWMutex
+	voters map[uint64]struct{}
 
 	// Fencing epoch state (also owned by run()). myEpoch is the epoch this
 	// node claimed at boot by CAS-bumping meta/epoch — the s3raft analog
@@ -475,9 +486,7 @@ func (n *node) claimEpoch() error {
 		return err
 	}
 	n.myEpoch = epoch
-	if epoch > n.maxTerm {
-		n.maxTerm = epoch
-	}
+	n.bumpMaxTerm(epoch)
 	n.lead = n.id
 	n.isLeader = true
 	n.pendingSoft = &raft.SoftState{Lead: n.id, RaftState: raft.StateLeader}
@@ -676,9 +685,7 @@ func (n *node) ingest(ents []*raftpb.Entry) {
 		n.lastIndex = idx
 		n.pendingEntries = append(n.pendingEntries, ent)
 		n.pendingCommit = append(n.pendingCommit, ent)
-		if t := ent.GetTerm(); t > n.maxTerm {
-			n.maxTerm = t
-		}
+		n.bumpMaxTerm(ent.GetTerm())
 	}
 	n.checkFenced()
 }
@@ -700,9 +707,7 @@ func (n *node) checkEpoch() {
 		n.lg.Warn("s3raft: epoch freshness check failed", zap.Error(err))
 		return
 	}
-	if d.Epoch > n.maxTerm {
-		n.maxTerm = d.Epoch
-	}
+	n.bumpMaxTerm(d.Epoch)
 	if n.isLeader {
 		if d.Epoch > n.myEpoch {
 			n.checkFenced() // a newer node claimed the epoch — demote
@@ -866,10 +871,42 @@ func (n *node) buildHeartbeats() {
 	n.pendingMsgs = msgs
 }
 
+// bumpMaxTerm raises maxTerm to t if t is higher. Run-goroutine only; takes
+// membMu so the checkpointer's concurrent read cannot tear.
+func (n *node) bumpMaxTerm(t uint64) {
+	n.membMu.Lock()
+	if t > n.maxTerm {
+		n.maxTerm = t
+	}
+	n.membMu.Unlock()
+}
+
+// getMaxTerm reads maxTerm under membMu, for the off-run checkpointer.
+func (n *node) getMaxTerm() uint64 {
+	n.membMu.RLock()
+	defer n.membMu.RUnlock()
+	return n.maxTerm
+}
+
+// voterSet returns a copy of the voter set under membMu, for the off-run
+// checkpointer to test membership without racing applyConf.
+func (n *node) voterSet() map[uint64]struct{} {
+	n.membMu.RLock()
+	defer n.membMu.RUnlock()
+	m := make(map[uint64]struct{}, len(n.voters))
+	for id := range n.voters {
+		m[id] = struct{}{}
+	}
+	return m
+}
+
 // voterList returns the current voter member IDs (sorted), for stamping
 // into checkpoint metadata so a restoring node can build the snapshot's
 // ConfState. Falls back to this node alone if membership is not yet known.
+// Takes membMu (RLock) because the checkpointer calls it off the run goroutine.
 func (n *node) voterList() []uint64 {
+	n.membMu.RLock()
+	defer n.membMu.RUnlock()
 	if len(n.voters) == 0 {
 		return []uint64{n.id}
 	}
@@ -1070,9 +1107,7 @@ func (n *node) confirmRead() (uint64, bool) {
 		return 0, false
 	}
 	if d.Epoch > n.myEpoch {
-		if d.Epoch > n.maxTerm {
-			n.maxTerm = d.Epoch
-		}
+		n.bumpMaxTerm(d.Epoch)
 		n.checkFenced()
 	}
 	// Freshness gate: advance local state to the store's authoritative committed
@@ -1167,6 +1202,9 @@ func (n *node) watchLog(ctx context.Context) {
 
 func (n *node) applyConf(cc raftpb.ConfChangeI) *raftpb.ConfState {
 	ccv2 := cc.AsV2()
+	// Lock across the mutation and the read-back so the off-run checkpointer
+	// never observes the map mid-write.
+	n.membMu.Lock()
 	for _, ch := range ccv2.GetChanges() {
 		switch ch.GetType() {
 		case raftpb.ConfChangeAddNode, raftpb.ConfChangeAddLearnerNode:
@@ -1179,6 +1217,7 @@ func (n *node) applyConf(cc raftpb.ConfChangeI) *raftpb.ConfState {
 	for id := range n.voters {
 		ids = append(ids, id)
 	}
+	n.membMu.Unlock()
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	return &raftpb.ConfState{Voters: ids}
 }

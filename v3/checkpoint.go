@@ -454,7 +454,10 @@ func (n *node) checkpoint(cli *client) {
 // Leader-only, and only when membership is known so a transient empty voter set
 // cannot delete live members' progress.
 func (n *node) pruneProgress(cli *client) {
-	if len(n.voters) == 0 {
+	// Snapshot the voter set under membMu; the run goroutine may mutate it
+	// (applyConf) concurrently, and an unsynchronized map read would crash.
+	voters := n.voterSet()
+	if len(voters) == 0 {
 		return
 	}
 	keys, err := cli.list("progress/")
@@ -466,7 +469,7 @@ func (n *node) pruneProgress(cli *client) {
 		if !ok {
 			continue
 		}
-		if _, member := n.voters[id]; !member {
+		if _, member := voters[id]; !member {
 			if derr := cli.del(k); derr == nil {
 				n.lg.Info("s3raft: pruned departed member progress",
 					zap.String("member-id", fmt.Sprintf("%x", id)))
@@ -487,7 +490,9 @@ func (n *node) uploadSnapshot(cli *client, index uint64) error {
 	if err := cli.put(snapDBKey(index), buf.Bytes()); err != nil {
 		return err
 	}
-	meta, err := json.Marshal(checkpointMeta{Index: index, Term: n.maxTerm, Voters: n.voterList()})
+	// getMaxTerm/voterList take membMu: this runs on the checkpointer goroutine,
+	// off the run goroutine that writes maxTerm and voters.
+	meta, err := json.Marshal(checkpointMeta{Index: index, Term: n.getMaxTerm(), Voters: n.voterList()})
 	if err != nil {
 		return err
 	}
