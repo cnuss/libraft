@@ -74,6 +74,11 @@ type client struct {
 	etagChain bool
 }
 
+// chainMode reports whether the store runs in etag-chain mode (see the
+// etagChain field). Exposed as a method so consumers can hold the store
+// interface rather than the concrete *client.
+func (c *client) chainMode() bool { return c.etagChain }
+
 // headKey is the HEAD pointer object used in etagChain mode.
 const headKey = "meta/head"
 

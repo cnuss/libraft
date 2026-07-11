@@ -62,7 +62,7 @@ var _ raft.Node = &node{}
 type node struct {
 	lg  *zap.Logger
 	id  uint64
-	cli *client
+	cli store
 
 	proposec  chan proposal
 	readc     chan []byte
@@ -586,7 +586,7 @@ func (n *node) fetchTail(after uint64) ([]*raftpb.Entry, error) {
 // HEAD pointer in etagChain mode, or the max published log-object index in
 // conditional mode. Zero means the log is empty (genesis).
 func (n *node) committedLogIndex() (uint64, error) {
-	if n.cli.etagChain {
+	if n.cli.chainMode() {
 		h, err := n.cli.readHead()
 		if err != nil {
 			return 0, err
@@ -621,7 +621,7 @@ func (n *node) seedLogFromLocal(index uint64) error {
 		return err
 	}
 	n.lastCheckpoint = index
-	if n.cli.etagChain {
+	if n.cli.chainMode() {
 		if err := n.cli.seedHead(index); err != nil {
 			return err
 		}
@@ -641,7 +641,7 @@ func (n *node) publishLocalEntries(ms *raft.MemoryStorage, from, to uint64) erro
 	if from > to {
 		return nil
 	}
-	if n.cli.etagChain && from > 1 {
+	if n.cli.chainMode() && from > 1 {
 		if err := n.cli.seedHead(from - 1); err != nil {
 			return fmt.Errorf("seed head at %d: %w", from-1, err)
 		}
@@ -1144,7 +1144,7 @@ func (n *node) syncToHead() error {
 		return err
 	}
 	n.ingest(tail)
-	if !n.cli.etagChain {
+	if !n.cli.chainMode() {
 		return nil // conditional mode: the log object IS the commit point
 	}
 	h, err := n.cli.readHead()
