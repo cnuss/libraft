@@ -283,7 +283,14 @@ func resolveNS(lg *zap.Logger, cfg config.ServerConfig) string {
 // token, data-dir parent, lowest peer URL, and bucket all match.
 func nsFromConfig(cfg config.ServerConfig) string {
 	root := filepath.Dir(strings.TrimRight(cfg.DataDir, string(filepath.Separator)))
-	key := root + "|" + cfg.InitialClusterToken + "|" + minPeerURL(cfg)
+	// Length-prefix each field so the concatenation is injective: a raw
+	// "|"-join lets ("/data|a","b") and ("/data","a|b") collide, silently
+	// pointing two distinct clusters at one shared log ("|" is legal in both a
+	// data-dir path and an operator-chosen cluster token). The docstring's
+	// "all three must match" guarantee depends on this being unambiguous.
+	token := cfg.InitialClusterToken
+	peer := minPeerURL(cfg)
+	key := fmt.Sprintf("%d:%s%d:%s%d:%s", len(root), root, len(token), token, len(peer), peer)
 	return fmt.Sprintf("c-%016x", fnv64a(key))
 }
 
@@ -323,15 +330,28 @@ func prepareRestore(lg *zap.Logger, cfg config.ServerConfig) error {
 	if err != nil {
 		return err
 	}
-	meta, err := readCheckpointMeta(cli)
-	if err == errNotFound {
-		return nil // no snapshot yet; fresh cluster
-	}
-	if err != nil {
-		return err
-	}
-	db, err := cli.get(snapDBKey(meta.Index))
-	if err != nil {
+	// Resolve meta -> db atomically-by-retry: the leader's checkpoint tick can
+	// GC snap/<index>.db (uploadSnapshot's GC loop) between our meta read and the
+	// db fetch, 404ing an in-flight download. On errNotFound re-read meta — which
+	// now points at the newer, still-present snapshot — and retry. Without this a
+	// 404 would surface as "start empty" and open a truncation gap.
+	var meta checkpointMeta
+	var db []byte
+	for attempt := 0; ; attempt++ {
+		meta, err = readCheckpointMeta(cli)
+		if err == errNotFound {
+			return nil // no snapshot yet; fresh cluster
+		}
+		if err != nil {
+			return err
+		}
+		db, err = cli.get(snapDBKey(meta.Index))
+		if err == nil {
+			break
+		}
+		if err == errNotFound && attempt < 4 {
+			continue // GC raced us between meta and db; re-resolve
+		}
 		return err
 	}
 
@@ -443,39 +463,46 @@ func (n *node) checkpoint(cli *client) {
 	}
 	n.lastCheckpoint = localSnap
 	checkpointIndex.Set(float64(localSnap))
-	n.pruneProgress(cli)
-	n.truncateLog(cli)
+	// pruneProgress lists progress/ once and returns the surviving keys, which
+	// truncateLog reuses so the floor computation need not list again.
+	survivors := n.pruneProgress(cli)
+	n.truncateLog(cli, survivors)
 }
 
-// pruneProgress removes progress records for members no longer in the cluster.
-// Without this, a departed member's last-published snapshot index would pin the
-// truncation floor forever (truncationFloor takes the min across all progress
-// objects), so the log could never be truncated after any membership removal.
+// pruneProgress removes progress records for members no longer in the cluster
+// and returns the surviving progress/ keys (for truncationFloor to reuse without
+// re-listing). Without pruning, a departed member's last-published snapshot index
+// would pin the truncation floor forever (truncationFloor takes the min across
+// all progress objects), so the log could never be truncated after any removal.
 // Leader-only, and only when membership is known so a transient empty voter set
-// cannot delete live members' progress.
-func (n *node) pruneProgress(cli *client) {
+// cannot delete live members' progress. Returns nil when membership is unknown or
+// the list fails, signalling truncationFloor to list for itself.
+func (n *node) pruneProgress(cli *client) []string {
 	// Snapshot the voter set under membMu; the run goroutine may mutate it
 	// (applyConf) concurrently, and an unsynchronized map read would crash.
 	voters := n.voterSet()
 	if len(voters) == 0 {
-		return
+		return nil
 	}
 	keys, err := cli.list("progress/")
 	if err != nil {
-		return
+		return nil
 	}
+	survivors := make([]string, 0, len(keys))
 	for _, k := range keys {
-		id, ok := parseProgressKey(k)
-		if !ok {
-			continue
-		}
-		if _, member := voters[id]; !member {
-			if derr := cli.del(k); derr == nil {
-				n.lg.Info("s3raft: pruned departed member progress",
-					zap.String("member-id", fmt.Sprintf("%x", id)))
+		if id, ok := parseProgressKey(k); ok {
+			if _, member := voters[id]; !member {
+				if derr := cli.del(k); derr == nil {
+					n.lg.Info("s3raft: pruned departed member progress",
+						zap.String("member-id", fmt.Sprintf("%x", id)))
+					continue // dropped; not a survivor
+				}
+				// delete failed: keep it so the floor stays conservative
 			}
 		}
+		survivors = append(survivors, k)
 	}
+	return survivors
 }
 
 // uploadSnapshot writes a consistent bbolt snapshot to the bucket, then
@@ -502,10 +529,20 @@ func (n *node) uploadSnapshot(cli *client, index uint64) error {
 	n.lg.Info("s3raft: wrote bucket snapshot",
 		zap.Uint64("index", index), zap.Int("bytes", buf.Len()))
 
-	// GC older snapshot db objects.
+	// GC older snapshot db objects, but retain the immediately-previous one:
+	// a restorer that already read an older meta must still be able to fetch its
+	// db. Keeping the last two means a single concurrent checkpoint never orphans
+	// an in-flight reader; prepareRestore's retry covers the rarer case of two
+	// checkpoints landing during one restore.
 	if keys, lerr := cli.list("snap/"); lerr == nil {
+		prev := uint64(0)
 		for _, k := range keys {
-			if idx, ok := parseSnapDBKey(k); ok && idx < index {
+			if idx, ok := parseSnapDBKey(k); ok && idx < index && idx > prev {
+				prev = idx // highest index strictly below the new one
+			}
+		}
+		for _, k := range keys {
+			if idx, ok := parseSnapDBKey(k); ok && idx < prev {
 				_ = cli.del(k)
 			}
 		}
@@ -515,8 +552,8 @@ func (n *node) uploadSnapshot(cli *client, index uint64) error {
 
 // truncateLog deletes log objects at or below the cluster-wide safe floor
 // (min published progress minus a catch-up margin).
-func (n *node) truncateLog(cli *client) {
-	floor := n.truncationFloor(cli)
+func (n *node) truncateLog(cli *client, progressKeys []string) {
+	floor := n.truncationFloor(cli, progressKeys)
 	if floor <= truncateMargin {
 		return
 	}
@@ -542,9 +579,17 @@ func (n *node) truncateLog(cli *client) {
 // truncationFloor is the minimum FirstIndex across all members' published
 // progress. Truncating below it is safe: no member still needs those
 // entries (each has snapshotted past them locally).
-func (n *node) truncationFloor(cli *client) uint64 {
-	keys, err := cli.list("progress/")
-	if err != nil || len(keys) == 0 {
+func (n *node) truncationFloor(cli *client, keys []string) uint64 {
+	// keys == nil means the caller has no cached listing (membership unknown or
+	// pruneProgress's list failed); list here. A non-nil empty slice means the
+	// caller listed and found nothing, so the floor is 0.
+	if keys == nil {
+		var err error
+		if keys, err = cli.list("progress/"); err != nil {
+			return 0
+		}
+	}
+	if len(keys) == 0 {
 		return 0
 	}
 	min := uint64(math.MaxUint64)
