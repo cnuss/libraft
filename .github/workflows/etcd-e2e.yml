@@ -144,9 +144,12 @@ jobs:
           RUN=""
           [ -n "${E2E_SUBSET}" ] && RUN="-run ${E2E_SUBSET}"
           echo "mode=${{ matrix.mode }}  scope='${E2E_SUBSET:-<full suite>}'"
-          # -p 2 caps concurrent test binaries so parallel multi-node clusters
-          # don't exhaust ports/CPU; -timeout bounds a hang under the hijack.
-          go test ./e2e ${RUN} -count=1 -v -p 2 -timeout 90m 2>&1 \
+          # -p 1 -parallel 1 fully serializes: at most one cluster's processes
+          # run at a time, so no CPU contention starves watch-event delivery
+          # (the cause of etcd's own flaky TestWatchDelay* fails). Slower, but
+          # the counts become deterministic. -timeout bounds a hang under the
+          # hijack; raised because serial execution is ~2x wall-clock.
+          go test ./e2e ${RUN} -count=1 -v -p 1 -parallel 1 -timeout 150m 2>&1 \
             | tee "$GITHUB_WORKSPACE/e2e-${{ matrix.mode }}.log"
 
       - name: summarize
