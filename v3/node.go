@@ -559,23 +559,69 @@ func foldMembership(entries []*raftpb.Entry) (voters, learners map[uint64]struct
 	return voters, learners
 }
 
-// fetchTail lists and fetches all log entries with index > after.
+// fetchLogWorkers bounds how many log objects fetchTail downloads concurrently,
+// so a large catch-up does not open one connection per object.
+const fetchLogWorkers = 8
+
+// fetchTail lists and fetches all log entries with index > after. The objects
+// are independent, so they are downloaded concurrently (bounded pool) and
+// reassembled in index order — turning a K-object catch-up from K sequential
+// round-trips into roughly ceil(K / fetchLogWorkers).
 func (n *node) fetchTail(after uint64) ([]*raftpb.Entry, error) {
 	keys, err := n.cli.listAfter("log/", logKey(after))
 	if err != nil {
 		return nil, err
 	}
 	sort.Strings(keys) // zero-padded keys sort numerically
-	var ents []*raftpb.Entry
+	logKeys := make([]string, 0, len(keys))
 	for _, k := range keys {
-		if _, ok := parseLogKey(k); !ok {
-			continue
+		if _, ok := parseLogKey(k); ok {
+			logKeys = append(logKeys, k)
 		}
-		body, gerr := n.cli.get(k)
-		if gerr != nil {
-			return nil, gerr
+	}
+
+	// Download each object into its ordered slot concurrently; the first GET
+	// error wins and short-circuits the rest.
+	bodies := make([][]byte, len(logKeys))
+	var (
+		wg   sync.WaitGroup
+		sem  = make(chan struct{}, fetchLogWorkers)
+		mu   sync.Mutex
+		ferr error
+	)
+	for i, k := range logKeys {
+		mu.Lock()
+		stop := ferr != nil
+		mu.Unlock()
+		if stop {
+			break
 		}
-		batch, derr := decodeEntries(body)
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, k string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			body, gerr := n.cli.get(k)
+			if gerr != nil {
+				mu.Lock()
+				if ferr == nil {
+					ferr = gerr
+				}
+				mu.Unlock()
+				return
+			}
+			bodies[i] = body
+		}(i, k)
+	}
+	wg.Wait()
+	if ferr != nil {
+		return nil, ferr
+	}
+
+	// Reassemble in index order.
+	var ents []*raftpb.Entry
+	for i, k := range logKeys {
+		batch, derr := decodeEntries(bodies[i])
 		if derr != nil {
 			return nil, fmt.Errorf("s3raft: corrupt log object %s: %w", k, derr)
 		}
