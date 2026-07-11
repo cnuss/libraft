@@ -12,7 +12,7 @@
 // mach_vm_protect, task_self_trap and sys_icache_invalidate live in
 // libSystem, not the BSD syscall table, so they are reached the same way
 // the standard library reaches darwin libc: //go:cgo_import_dynamic pulls
-// each symbol in, a NOSPLIT assembly trampoline (hijack_darwin_*.s) jumps
+// each symbol in, a NOSPLIT assembly trampoline (init_darwin_<arch>.s) jumps
 // to it, and runtime.syscall_syscall6 invokes it on the system stack. This
 // needs no cgo and no module dependency.
 
@@ -76,7 +76,7 @@ func funcPC(f func()) uintptr {
 //go:linkname syscall6 syscall.syscall6
 func syscall6(fn, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2, err uintptr)
 
-// Assembly trampolines defined in hijack_darwin_<arch>.s. Each jumps to the
+// Assembly trampolines defined in init_darwin_<arch>.s. Each jumps to the
 // dynamically imported libSystem symbol declared below.
 func machVMProtectTrampoline()
 func taskSelfTrapTrampoline()

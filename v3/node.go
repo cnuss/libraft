@@ -17,7 +17,9 @@ package v3
 import (
 	"context"
 	"fmt"
+	"maps"
 	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -830,13 +832,20 @@ func (n *node) run() {
 	}
 }
 
+// hardState returns the HardState this node advertises: the highest term seen,
+// a self-vote, and the committed index. Shared by makeReady and status. Run
+// goroutine only (reads maxTerm without membMu).
+func (n *node) hardState() *raftpb.HardState {
+	return &raftpb.HardState{
+		Term:   proto.Uint64(n.maxTerm),
+		Vote:   proto.Uint64(n.id),
+		Commit: proto.Uint64(n.lastIndex),
+	}
+}
+
 func (n *node) makeReady() raft.Ready {
 	rd := raft.Ready{
-		HardState: &raftpb.HardState{
-			Term:   proto.Uint64(n.maxTerm),
-			Vote:   proto.Uint64(n.id),
-			Commit: proto.Uint64(n.lastIndex),
-		},
+		HardState:        n.hardState(),
 		Entries:          n.pendingEntries,
 		CommittedEntries: n.pendingCommit,
 		ReadStates:       n.pendingReads,
@@ -900,6 +909,12 @@ func (n *node) voterSet() map[uint64]struct{} {
 	return m
 }
 
+// sortedVotersLocked returns the voter member IDs sorted ascending. Caller must
+// hold membMu (RLock or Lock).
+func (n *node) sortedVotersLocked() []uint64 {
+	return slices.Sorted(maps.Keys(n.voters))
+}
+
 // voterList returns the current voter member IDs (sorted), for stamping
 // into checkpoint metadata so a restoring node can build the snapshot's
 // ConfState. Falls back to this node alone if membership is not yet known.
@@ -910,12 +925,7 @@ func (n *node) voterList() []uint64 {
 	if len(n.voters) == 0 {
 		return []uint64{n.id}
 	}
-	ids := make([]uint64, 0, len(n.voters))
-	for id := range n.voters {
-		ids = append(ids, id)
-	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	return ids
+	return n.sortedVotersLocked()
 }
 
 // maxBatchEntries caps how many queued proposals coalesce into one log object,
@@ -1213,12 +1223,8 @@ func (n *node) applyConf(cc raftpb.ConfChangeI) *raftpb.ConfState {
 			delete(n.voters, ch.GetNodeId())
 		}
 	}
-	ids := make([]uint64, 0, len(n.voters))
-	for id := range n.voters {
-		ids = append(ids, id)
-	}
+	ids := n.sortedVotersLocked()
 	n.membMu.Unlock()
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	return &raftpb.ConfState{Voters: ids}
 }
 
@@ -1231,12 +1237,8 @@ func (n *node) status() raft.Status {
 	}
 	st := raft.Status{
 		BasicStatus: raft.BasicStatus{
-			ID: n.id,
-			HardState: &raftpb.HardState{
-				Term:   proto.Uint64(n.maxTerm),
-				Vote:   proto.Uint64(n.id),
-				Commit: proto.Uint64(n.lastIndex),
-			},
+			ID:        n.id,
+			HardState: n.hardState(),
 			SoftState: soft,
 			Applied:   n.lastIndex,
 		},

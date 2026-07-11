@@ -119,8 +119,8 @@ func newClient(rawurl string) (*client, error) {
 		secretKey:    cr.secretKey,
 		sessionToken: cr.sessionToken,
 		// Optional server-side encryption for log/snapshot objects.
-		sse:       firstEnv("ETCD_S3LOG_SSE", "", ""),
-		sseKMSKey: firstEnv("ETCD_S3LOG_SSE_KMS_KEY_ID", "", ""),
+		sse:       firstEnv("", "ETCD_S3LOG_SSE"),
+		sseKMSKey: firstEnv("", "ETCD_S3LOG_SSE_KMS_KEY_ID"),
 		hc:        &http.Client{Timeout: 30 * time.Second},
 	}
 	if len(parts) == 2 && parts[1] != "" {
@@ -147,19 +147,13 @@ func openStore(rawurl, ns string) (*client, error) {
 	return cli, nil
 }
 
-func envOr(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return def
-}
-
-func firstEnv(k1, k2, def string) string {
-	if v := os.Getenv(k1); v != "" {
-		return v
-	}
-	if v := os.Getenv(k2); v != "" {
-		return v
+// firstEnv returns the first non-empty value among the named environment
+// variables, or def if none is set.
+func firstEnv(def string, keys ...string) string {
+	for _, k := range keys {
+		if v := os.Getenv(k); v != "" {
+			return v
+		}
 	}
 	return def
 }
@@ -175,10 +169,11 @@ type awsCreds struct {
 // is signed as X-Amz-Security-Token when present.
 func awsCredsFromEnv() awsCreds {
 	return awsCreds{
-		accessKey:    firstEnv("ETCD_S3LOG_ACCESS_KEY", "AWS_ACCESS_KEY_ID", "minioadmin"),
-		secretKey:    firstEnv("ETCD_S3LOG_SECRET_KEY", "AWS_SECRET_ACCESS_KEY", "minioadmin"),
-		sessionToken: firstEnv("ETCD_S3LOG_SESSION_TOKEN", "AWS_SESSION_TOKEN", ""),
-		region:       envOr("ETCD_S3LOG_REGION", "us-east-1"),
+		accessKey:    firstEnv("minioadmin", "ETCD_S3LOG_ACCESS_KEY", "AWS_ACCESS_KEY_ID"),
+		secretKey:    firstEnv("minioadmin", "ETCD_S3LOG_SECRET_KEY", "AWS_SECRET_ACCESS_KEY"),
+		sessionToken: firstEnv("", "ETCD_S3LOG_SESSION_TOKEN", "AWS_SESSION_TOKEN"),
+		// AWS_REGION / AWS_DEFAULT_REGION let a standard AWS env work unchanged.
+		region: firstEnv("us-east-1", "ETCD_S3LOG_REGION", "AWS_REGION", "AWS_DEFAULT_REGION"),
 	}
 }
 

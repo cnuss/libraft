@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -32,7 +33,20 @@ func newRunner(t *testing.T, name string) *runner {
 // exitCode is -1 if the process could not be started.
 func (r *runner) run(t *testing.T, args ...string) (string, int) {
 	t.Helper()
-	out, err := exec.Command(r.bin, args...).CombinedOutput()
+	cmd := exec.Command(r.bin, args...)
+	// Hermetic: strip ETCD_S3LOG_URL so an ambient value (e.g. exported by the
+	// etcd-e2e job) can't flip the example into s3raft mode — which this table
+	// does not assert on and which needs a live S3 store.
+	env := os.Environ()
+	filtered := env[:0]
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "ETCD_S3LOG_URL=") {
+			continue
+		}
+		filtered = append(filtered, kv)
+	}
+	cmd.Env = filtered
+	out, err := cmd.CombinedOutput()
 	code := 0
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {

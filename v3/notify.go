@@ -135,6 +135,10 @@ func (p *PushNotifier) Watch(ctx context.Context, wake func()) error {
 // delivery: the node re-reads the whole tail regardless.
 func (p *PushNotifier) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
+	// Cap the body: this endpoint is reachable by anything that can POST to it,
+	// and a real S3/SNS notification is well under 1 MiB. MaxBytesReader makes an
+	// oversize body surface as a decode error, handled by the 400 branch below.
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var ev s3Event
 	if err := json.NewDecoder(r.Body).Decode(&ev); err != nil {
 		http.Error(w, "bad s3 event", http.StatusBadRequest)
@@ -155,15 +159,27 @@ func (p *PushNotifier) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // what counts as a log key (see isLogKey).
 func s3EventCreatesLogObject(ev s3Event) bool {
 	for _, rec := range ev.Records {
-		key := rec.S3.Object.Key
-		if dec, derr := url.QueryUnescape(key); derr == nil {
-			key = dec // S3 notification keys are URL-encoded
+		// Only object-creation events append to the log; skip removals etc. so a
+		// delete/GC notification does not needlessly wake the node. S3 names these
+		// "s3:ObjectCreated:Put" (some sources drop the "s3:"), so match on the
+		// stable middle rather than a prefix.
+		if rec.EventName != "" && !strings.Contains(rec.EventName, "ObjectCreated") {
+			continue
 		}
-		if isLogKey(key) {
+		if isLogKey(decodeS3Key(rec.S3.Object.Key)) {
 			return true
 		}
 	}
 	return false
+}
+
+// decodeS3Key URL-decodes an S3 notification object key (they arrive
+// percent-encoded), returning the key unchanged if it is not valid encoding.
+func decodeS3Key(key string) string {
+	if dec, err := url.QueryUnescape(key); err == nil {
+		return dec
+	}
+	return key
 }
 
 // s3Event is the subset of an S3 event notification record we consume.
@@ -215,10 +231,7 @@ func (c *client) listenBucketNotifications(ctx context.Context, keyPrefix string
 			continue
 		}
 		for _, r := range ev.Records {
-			key := r.S3.Object.Key
-			if dec, derr := url.QueryUnescape(key); derr == nil {
-				key = dec // S3 notification keys are URL-encoded
-			}
+			key := decodeS3Key(r.S3.Object.Key)
 			onEvent(strings.TrimPrefix(key, c.prefix))
 		}
 	}
