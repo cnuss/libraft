@@ -1,0 +1,207 @@
+# Runs a subset of etcd's OWN e2e suite against two binaries and compares:
+#
+#   baseline — stock etcd (built from the pinned etcd checkout), no hijack.
+#   reflect  — stock etcd + the s3raft installer blank-imported
+#              (tests/e2e-etcd), ETCD_S3LOG_URL pointed at a MinIO container.
+#
+# The hijacked binary is stock etcd with one blank import (etcdmain.Main is
+# exported), built in an isolated module so etcdmain's deps never touch the
+# root go.mod. etcd's e2e framework resolves the server binary from
+# <etcd>/bin/etcd, so the reflect leg just overwrites that one file.
+#
+# A test failure fails the step (pipefail + no continue-on-error). Both legs
+# run the E2E_SUBSET below — the slice of etcd's own suite s3raft is known to
+# pass (single-node + a real multi-member cluster), so both gate green.
+# s3raft documents whole classes of e2e as unsupported (leader transfer,
+# simultaneous discovery bootstrap, periodic corruption check, force-new);
+# those are excluded from the subset and only run when E2E_SUBSET is cleared
+# for a manual full-surface mapping. Baseline proves the harness itself works;
+# the baseline-vs-reflect diff is the map of what s3raft supports (issue #20).
+
+name: etcd-e2e
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - "v3/**"
+      - "tests/e2e-etcd/**"
+      - ".github/workflows/etcd-e2e.yml"
+  # main re-runs the same subset post-merge, guarding against drift landing on
+  # the default branch (both PR and push use the E2E_SUBSET gate below).
+  push:
+    branches: [main]
+    paths:
+      - "v3/**"
+      - "tests/e2e-etcd/**"
+      - ".github/workflows/etcd-e2e.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # etcd release the hijack + this harness are pinned to (must match the
+  # go.etcd.io/etcd/server/v3 version in go.mod / tests/e2e-etcd/go.mod).
+  ETCD_REF: v3.7.0
+  # Both PRs and main run the SAME fast, high-value subset of etcd's OWN suite
+  # that s3raft is known to pass (confirmed against the full run in issue #20) —
+  # enough to prove a CLUSTER stays functional through the S3 log, not just a
+  # single node:
+  #   single-node functional: KV, txn, lease, watch, compaction, auth, elect, lock
+  #   multi-member:           multi-peer bring-up, member add/list/update/promote,
+  #                           learners, linearizable + consistent reads,
+  #                           runtime grow/shrink of the cluster
+  # Deliberately EXCLUDED (red-by-design under the hijack, per LIMITATIONS.md):
+  # leader transfer, simultaneous discovery bootstrap, network-partition health,
+  # the periodic corruption check, rolling upgrade. To re-map the full surface,
+  # clear this value (E2E_SUBSET="") on a manual workflow_dispatch run.
+  # Regex must be shell-safe (no spaces or parens; spliced unquoted into -run).
+  # NOTE: TestRuntimeReconfig is listed as the two passing variants explicitly
+  # because bare `TestRuntimeReconfig` would also match RollingUpgrade (fails).
+  E2E_SUBSET: "TestCtlV3Put|TestCtlV3Get|TestCtlV3Del|TestCtlV3Txn|TestCtlV3Lease|TestCtlV3Watch|TestCtlV3Compact|TestCtlV3Auth|TestCtlV3Elect|TestCtlV3Lock|TestCtlV3Member|TestCtlV3LinearizableRead|TestCtlV3ConsistentMemberList|TestEtcdMultiPeer|TestRuntimeReconfigGrowClusterSize|TestRuntimeReconfigDecreaseClusterSize"
+
+jobs:
+  e2e:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [baseline, reflect]
+    steps:
+      - name: checkout libraft
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: libraft
+
+      - name: checkout etcd ${{ env.ETCD_REF }}
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: etcd-io/etcd
+          ref: ${{ env.ETCD_REF }}
+          path: etcd
+
+      - name: setup go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: etcd/go.mod
+
+      - name: build stock etcd binaries
+        working-directory: etcd
+        run: |
+          make build
+          ls -l bin/
+          ./bin/etcd --version
+
+      - name: build hijacked etcd (reflect only)
+        if: matrix.mode == 'reflect'
+        working-directory: libraft/tests/e2e-etcd
+        run: |
+          # Overwrite ONLY the server binary; etcdctl/etcdutl stay stock.
+          CGO_ENABLED=0 go build -o "$GITHUB_WORKSPACE/etcd/bin/etcd" .
+          "$GITHUB_WORKSPACE/etcd/bin/etcd" --version
+
+      - name: start MinIO (reflect only)
+        if: matrix.mode == 'reflect'
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+          # Wait for readiness.
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:9000/minio/health/live; then echo ready; break; fi
+            sleep 1
+          done
+
+      # Isolate hijack startup from the e2e framework: run the hijacked binary
+      # standalone with minimal single-node args and capture its FULL output.
+      # Also dump the addresses of the patch target and the patcher — if they
+      # land on the same page the monkey-patch SIGBUSes (the hazard that got the
+      # newRaftNode seam reverted once; this full etcd binary is where it bit).
+      - name: smoke — hijacked etcd standalone (reflect only)
+        if: matrix.mode == 'reflect'
+        continue-on-error: true
+        env:
+          ETCD_S3LOG_URL: http://127.0.0.1:9000/etcd-smoke
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+        run: |
+          echo "== symbol gap (same-page SIGBUS hazard) =="
+          go tool nm "$GITHUB_WORKSPACE/etcd/bin/etcd" \
+            | grep -E 'bootstrappedRaft\)\.newRaftNode$|reflect\.writeText$|v3\.NewRaftNode$' || echo "(symbols not found)"
+          echo "== launch standalone =="
+          D=$(mktemp -d)
+          "$GITHUB_WORKSPACE/etcd/bin/etcd" --data-dir "$D" --name smoke \
+            --listen-client-urls http://127.0.0.1:23790 --advertise-client-urls http://127.0.0.1:23790 \
+            --listen-peer-urls http://127.0.0.1:23791 --initial-advertise-peer-urls http://127.0.0.1:23791 \
+            --initial-cluster smoke=http://127.0.0.1:23791 --initial-cluster-state new \
+            > "$GITHUB_WORKSPACE/smoke.log" 2>&1 &
+          PID=$!
+          for i in $(seq 1 25); do
+            if grep -q "ready to serve client requests" "$GITHUB_WORKSPACE/smoke.log"; then echo "READY"; break; fi
+            if ! kill -0 $PID 2>/dev/null; then echo "PROCESS EXITED EARLY (code $?)"; break; fi
+            sleep 1
+          done
+          kill $PID 2>/dev/null || true
+          echo "== smoke.log (full) =="
+          cat "$GITHUB_WORKSPACE/smoke.log"
+
+      - name: run etcd e2e (${{ matrix.mode }})
+        id: e2e
+        # A test failure fails this step (and the job): pipefail propagates
+        # go test's exit code through the tee, and there is no continue-on-error
+        # masking it. The default E2E_SUBSET is the known-passing slice, so the
+        # gate is green; clearing it (manual full run) turns the reflect leg red
+        # on the ~28 documented-unsupported tests.
+        working-directory: etcd/tests
+        env:
+          # etcd's own scripts/test.sh exports ETCD_VERIFY=all for every e2e
+          # run — it turns on the server's internal consistency/hash checks
+          # during tests. Match it: baseline then mirrors etcd's real CI, and
+          # the reflect leg gets a stronger assertion that s3raft doesn't leave
+          # bbolt state etcd's verifier would reject.
+          ETCD_VERIFY: all
+          # Only set for the reflect leg; the spawned etcd inherits this env, so
+          # the installer activates. Unset (baseline) => the installer no-ops.
+          ETCD_S3LOG_URL: ${{ matrix.mode == 'reflect' && 'http://127.0.0.1:9000/etcd-e2e' || '' }}
+          AWS_ACCESS_KEY_ID: ${{ matrix.mode == 'reflect' && 'minioadmin' || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ matrix.mode == 'reflect' && 'minioadmin' || '' }}
+        run: |
+          set -o pipefail  # without this, tee's exit 0 hides go test's failure
+          RUN=""
+          [ -n "${E2E_SUBSET}" ] && RUN="-run ${E2E_SUBSET}"
+          echo "mode=${{ matrix.mode }}  scope='${E2E_SUBSET:-<full suite>}'"
+          # -p 2 caps concurrent test binaries so parallel multi-node clusters
+          # don't exhaust ports/CPU; -timeout bounds a hang under the hijack.
+          # (Full serialization killed the watch-delay flake but was far too
+          # slow; those fails are etcd's own known-flaky tests regardless.)
+          go test ./e2e ${RUN} -count=1 -v -p 2 -timeout 90m 2>&1 \
+            | tee "$GITHUB_WORKSPACE/e2e-${{ matrix.mode }}.log"
+
+      - name: summarize
+        if: always()
+        run: |
+          L="$GITHUB_WORKSPACE/e2e-${{ matrix.mode }}.log"
+          {
+            echo "### etcd-e2e (${{ matrix.mode }}) — step ${{ steps.e2e.outcome }}"
+            echo "PASS: $(grep -ac -- '--- PASS' "$L" 2>/dev/null)  FAIL: $(grep -ac -- '--- FAIL' "$L" 2>/dev/null)  SKIP: $(grep -ac -- '--- SKIP' "$L" 2>/dev/null)"
+            echo ""
+            echo "Failing tests:"
+            echo '```'
+            grep -aoE '\-\-\- FAIL: [A-Za-z0-9_/]+' "$L" 2>/dev/null | sed 's/^--- FAIL: //' | sort -u || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: upload logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: e2e-${{ matrix.mode }}-logs
+          path: |
+            e2e-${{ matrix.mode }}.log
+            smoke.log
+          if-no-files-found: warn
