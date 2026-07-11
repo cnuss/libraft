@@ -343,9 +343,18 @@ func (c *client) appendCAS(firstIdx, lastIdx uint64, body []byte) error {
 		case http.StatusOK:
 			return nil
 		case http.StatusPreconditionFailed, http.StatusConflict:
-			// 412: object exists. 409: concurrent conditional writers, one
-			// of which may have won; callers treat both as "lost the race"
-			// and re-read the key.
+			// 412: object exists. 409: concurrent conditional writers, one won.
+			// But do() transparently retries transient 5xx/429/network faults, so
+			// a PUT that actually committed server-side can resurface here on the
+			// retry (the object now exists → 412). Distinguish "our own write won"
+			// from "another writer won" by content: a different writer's batch at
+			// this index has different bytes. Without this, a committed-then-
+			// ambiguously-failed append is misreported as errConflict, the caller
+			// re-ingests its own batch and re-proposes it, and non-idempotent ops
+			// (txn, lease grant) apply twice — an exactly-once violation.
+			if existing, gerr := c.get(logKey(lastIdx)); gerr == nil && bytes.Equal(existing, body) {
+				return nil
+			}
 			return errConflict
 		default:
 			return fmt.Errorf("s3raft: put %s: unexpected status %d", logKey(lastIdx), status)
@@ -555,6 +564,15 @@ func (c *client) putIfMatch(key string, body []byte, etag string) error {
 	case http.StatusOK:
 		return nil
 	case http.StatusPreconditionFailed, http.StatusConflict, http.StatusNotFound:
+		// Same committed-then-retried hazard as appendCAS: do() may re-issue this
+		// If-Match PUT after it already committed (our write changed the ETag, so
+		// the retry's If-Match now fails → 412). Read back and compare: if the
+		// stored object is byte-identical to what we wrote, our write won. This
+		// keeps a retried epoch bump / head seed from being mistaken for a lost
+		// CAS (which would consume an extra epoch or stall the etag chain).
+		if existing, gerr := c.get(key); gerr == nil && bytes.Equal(existing, body) {
+			return nil
+		}
 		return errConflict
 	default:
 		return fmt.Errorf("s3raft: conditional put %s: unexpected status %d", key, status)
@@ -623,8 +641,10 @@ const (
 	s3BaseBackoff       = 50 * time.Millisecond
 	s3MaxBackoff        = 2 * time.Second
 	s3PerAttemptTimeout = 5 * time.Second
-	// s3RetryBudget bounds total wall time across all retries so a hung store
-	// cannot block a caller (notably the single-threaded run loop) indefinitely.
+	// s3RetryBudget bounds total wall time across all retries — including each
+	// attempt's own execution, not just the inter-attempt sleeps — so a hung
+	// store cannot block a caller (notably the single-threaded run loop) past
+	// roughly this bound.
 	s3RetryBudget = 12 * time.Second
 )
 
@@ -644,7 +664,10 @@ func (c *client) do(method, key string, query url.Values, body []byte, extraHdr 
 		err      error
 	)
 	for attempt := 0; attempt < s3MaxAttempts; attempt++ {
-		status, respBody, hdr, err = c.doOnce(method, key, query, body, extraHdr)
+		if attempt > 0 && !time.Now().Before(deadline) {
+			break // budget exhausted before this attempt could start
+		}
+		status, respBody, hdr, err = c.doOnce(method, key, query, body, extraHdr, deadline)
 		if err == nil && !retryableStatus(status) {
 			return status, respBody, hdr, nil
 		}
@@ -664,8 +687,10 @@ func (c *client) do(method, key string, query url.Values, body []byte, extraHdr 
 	return status, respBody, hdr, err
 }
 
-// doOnce issues a single signed request under a per-attempt deadline.
-func (c *client) doOnce(method, key string, query url.Values, body []byte, extraHdr map[string]string) (int, []byte, http.Header, error) {
+// doOnce issues a single signed request under a per-attempt deadline, further
+// clamped by budgetDeadline so a hung attempt cannot overrun the overall retry
+// budget (see do).
+func (c *client) doOnce(method, key string, query url.Values, body []byte, extraHdr map[string]string, budgetDeadline time.Time) (int, []byte, http.Header, error) {
 	if method == http.MethodPut && key != "" {
 		extraHdr = c.withSSE(extraHdr) // encrypt object writes if configured
 	}
@@ -677,7 +702,11 @@ func (c *client) doOnce(method, key string, query url.Values, body []byte, extra
 	if base == nil {
 		base = context.Background()
 	}
-	ctx, cancel := context.WithTimeout(base, s3PerAttemptTimeout)
+	timeout := s3PerAttemptTimeout
+	if rem := time.Until(budgetDeadline); rem < timeout {
+		timeout = rem // don't let a single attempt exceed the remaining budget
+	}
+	ctx, cancel := context.WithTimeout(base, timeout)
 	defer cancel()
 	started := time.Now()
 	resp, err := c.hc.Do(req.WithContext(ctx))
