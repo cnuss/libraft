@@ -56,7 +56,7 @@ func SetNotifier(n LogNotifier) { customNotifier = n }
 // notifierFor returns the notifier the node should use for its log prefix, in
 // priority order: an injected custom notifier, else an SQS notifier if a queue
 // is configured (the AWS pull path), else the default MinIO streaming notifier.
-func notifierFor(cli *client, keyPrefix string) LogNotifier {
+func notifierFor(cli store, keyPrefix string) LogNotifier {
 	if customNotifier != nil {
 		return customNotifier
 	}
@@ -76,7 +76,7 @@ const notifyReconnectDelay = 500 * time.Millisecond
 // minioNotifier implements LogNotifier over MinIO's ListenBucketNotification
 // extension.
 type minioNotifier struct {
-	cli       *client
+	cli       store
 	keyPrefix string
 }
 

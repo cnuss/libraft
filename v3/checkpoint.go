@@ -389,7 +389,7 @@ func checkpointClient() (*client, error) {
 
 func snapDBKey(index uint64) string { return fmt.Sprintf("snap/%020d.db", index) }
 
-func readCheckpointMeta(cli *client) (checkpointMeta, error) {
+func readCheckpointMeta(cli store) (checkpointMeta, error) {
 	var m checkpointMeta
 	raw, err := cli.get("snap/meta")
 	if err != nil {
@@ -477,7 +477,7 @@ func (n *node) checkpoint(cli *client) {
 // Leader-only, and only when membership is known so a transient empty voter set
 // cannot delete live members' progress. Returns nil when membership is unknown or
 // the list fails, signalling truncationFloor to list for itself.
-func (n *node) pruneProgress(cli *client) []string {
+func (n *node) pruneProgress(cli store) []string {
 	// Snapshot the voter set under membMu; the run goroutine may mutate it
 	// (applyConf) concurrently, and an unsynchronized map read would crash.
 	voters := n.voterSet()
@@ -507,7 +507,7 @@ func (n *node) pruneProgress(cli *client) []string {
 
 // uploadSnapshot writes a consistent bbolt snapshot to the bucket, then
 // points the checkpoint meta at it and garbage-collects older db objects.
-func (n *node) uploadSnapshot(cli *client, index uint64) error {
+func (n *node) uploadSnapshot(cli store, index uint64) error {
 	snap := capturedBackend.Snapshot()
 	defer snap.Close()
 	var buf bytes.Buffer
@@ -552,7 +552,7 @@ func (n *node) uploadSnapshot(cli *client, index uint64) error {
 
 // truncateLog deletes log objects at or below the cluster-wide safe floor
 // (min published progress minus a catch-up margin).
-func (n *node) truncateLog(cli *client, progressKeys []string) {
+func (n *node) truncateLog(cli store, progressKeys []string) {
 	floor := n.truncationFloor(cli, progressKeys)
 	if floor <= truncateMargin {
 		return
@@ -579,7 +579,7 @@ func (n *node) truncateLog(cli *client, progressKeys []string) {
 // truncationFloor is the minimum FirstIndex across all members' published
 // progress. Truncating below it is safe: no member still needs those
 // entries (each has snapshotted past them locally).
-func (n *node) truncationFloor(cli *client, keys []string) uint64 {
+func (n *node) truncationFloor(cli store, keys []string) uint64 {
 	// keys == nil means the caller has no cached listing (membership unknown or
 	// pruneProgress's list failed); list here. A non-nil empty slice means the
 	// caller listed and found nothing, so the floor is 0.
