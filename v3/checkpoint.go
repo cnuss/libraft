@@ -68,6 +68,22 @@ const (
 // namespace derived from the (identical-across-members, restart-stable)
 // initial-cluster configuration; the node reuses it so log and snapshot
 // objects share one prefix.
+// backendSnapshotter is the slice of the bbolt backend the checkpointer needs:
+// a consistent point-in-time snapshot. *backend.Backend satisfies it, and tests
+// substitute a fake through snapshotSource without standing up a real backend.
+type backendSnapshotter interface {
+	Snapshot() backend.Snapshot
+}
+
+// snapshotSource returns the current snapshot source — the backend captured by
+// the OpenBackend hijack. Indirected through a var so tests can inject a fake.
+var snapshotSource = func() backendSnapshotter {
+	if capturedBackend == nil {
+		return nil
+	}
+	return capturedBackend
+}
+
 var (
 	capturedBackend backend.Backend
 	ActiveNS        string
@@ -508,7 +524,11 @@ func (n *node) pruneProgress(cli store) []string {
 // uploadSnapshot writes a consistent bbolt snapshot to the bucket, then
 // points the checkpoint meta at it and garbage-collects older db objects.
 func (n *node) uploadSnapshot(cli store, index uint64) error {
-	snap := capturedBackend.Snapshot()
+	src := snapshotSource()
+	if src == nil {
+		return fmt.Errorf("s3raft: no captured backend to snapshot")
+	}
+	snap := src.Snapshot()
 	defer snap.Close()
 	var buf bytes.Buffer
 	if _, err := snap.WriteTo(&buf); err != nil {

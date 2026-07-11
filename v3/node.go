@@ -63,6 +63,7 @@ type node struct {
 	lg  *zap.Logger
 	id  uint64
 	cli store
+	clk clock // wall-clock seam for the sync-debounce cooldown + CAS backoff
 
 	proposec  chan proposal
 	readc     chan []byte
@@ -277,6 +278,7 @@ func Start(lg *zap.Logger, rawurl string, id uint64, nsKey string, peers []raft.
 		lg:        lg.Named("s3raft"),
 		id:        id,
 		cli:       cli,
+		clk:       realClock{},
 		proposec:  make(chan proposal),
 		readc:     make(chan []byte),
 		confc:     make(chan confReq),
@@ -961,7 +963,7 @@ drain:
 		// "could not retrieve cluster information"). Holding the ConfChange here
 		// (before run() emits it as a committed entry, which is what unblocks
 		// MemberAdd) gives every peer a full poll interval to catch up first.
-		time.Sleep(memberChangePropagationDelay)
+		n.clk.Sleep(memberChangePropagationDelay)
 	}
 	for _, p := range batch {
 		if p.resc != nil {
@@ -1049,7 +1051,7 @@ func (n *node) appendBatch(batch []proposal) error {
 		if len(tail) == 0 {
 			// 409 race where the winner's object is not visible yet: back off
 			// with jitter, ramping up so a hot multi-writer key does not thrash.
-			time.Sleep(backoff + jitter(backoff))
+			n.clk.Sleep(backoff + jitter(backoff))
 			if backoff *= 2; backoff > conflictMaxBackoff {
 				backoff = conflictMaxBackoff
 			}
@@ -1075,7 +1077,7 @@ const (
 // blocking I/O and starving proposals. A poke arriving during the cooldown
 // re-arms a single deferred poke so no change is missed. Owned by run().
 func (n *node) syncTail() {
-	if d := time.Since(n.lastSync); d < minSyncInterval {
+	if d := n.clk.Since(n.lastSync); d < minSyncInterval {
 		if !n.resyncArmed {
 			n.resyncArmed = true
 			time.AfterFunc(minSyncInterval-d, n.poke)
@@ -1084,7 +1086,7 @@ func (n *node) syncTail() {
 	}
 	n.resyncArmed = false
 	n.checkTail()
-	n.lastSync = time.Now()
+	n.lastSync = n.clk.Now()
 }
 
 // confirmRead establishes an authoritative, linearizable read index by

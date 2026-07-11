@@ -61,6 +61,7 @@ type client struct {
 	sseKMSKey    string          // KMS key id when sse == "aws:kms"
 	baseCtx      context.Context // cancelled on node shutdown to abort in-flight S3 calls
 	hc           *http.Client
+	clk          clock // wall-clock seam for the retry budget (realClock in prod)
 
 	// etagChain is enabled when the store does not support
 	// `If-None-Match: *` create-if-absent (community MinIO, see
@@ -127,6 +128,7 @@ func newClient(rawurl string) (*client, error) {
 		sse:       firstEnv("", "ETCD_S3LOG_SSE"),
 		sseKMSKey: firstEnv("", "ETCD_S3LOG_SSE_KMS_KEY_ID"),
 		hc:        &http.Client{Timeout: 30 * time.Second},
+		clk:       realClock{},
 	}
 	if len(parts) == 2 && parts[1] != "" {
 		c.prefix = parts[1] + "/"
@@ -416,7 +418,7 @@ func (c *client) readHead() (head, error) {
 // being bootstrapped from restored local state — see node.seedLogFromLocal.
 // No-op if HEAD already reached index (a peer seeded concurrently).
 func (c *client) seedHead(index uint64) error {
-	return retryCAS(func() error {
+	return c.retryCAS(func() error {
 		h, etag, err := c.loadHead()
 		if err != nil {
 			return err
@@ -436,14 +438,14 @@ func (c *client) seedHead(index uint64) error {
 // jitter between conflicting attempts so concurrent writers to one hot object
 // (e.g. every founder bumping meta/epoch at genesis) decorrelate instead of
 // thrashing. It gives up after casMaxAttempts.
-func retryCAS(fn func() error) error {
+func (c *client) retryCAS(fn func() error) error {
 	backoff := conflictBaseBackoff
 	for attempt := 0; attempt < casMaxAttempts; attempt++ {
 		err := fn()
 		if err != errConflict {
 			return err // nil (won), or a real error
 		}
-		time.Sleep(backoff + jitter(backoff))
+		c.clk.Sleep(backoff + jitter(backoff))
 		if backoff *= 2; backoff > conflictMaxBackoff {
 			backoff = conflictMaxBackoff
 		}
@@ -457,7 +459,7 @@ func retryCAS(fn func() error) error {
 // and LocalStack.
 func (c *client) bumpEpoch(owner uint64) (uint64, error) {
 	var claimed uint64
-	err := retryCAS(func() error {
+	err := c.retryCAS(func() error {
 		raw, etag, err := c.getWithETag(epochKey)
 		if err == errNotFound {
 			// Genesis: unconditional PUT of byte-identical content; racers
@@ -655,7 +657,7 @@ const (
 // rely on for CAS, are returned immediately and never retried. key=="" targets
 // the bucket itself.
 func (c *client) do(method, key string, query url.Values, body []byte, extraHdr map[string]string) (int, []byte, http.Header, error) {
-	deadline := time.Now().Add(s3RetryBudget)
+	deadline := c.clk.Now().Add(s3RetryBudget)
 	backoff := s3BaseBackoff
 	var (
 		status   int
@@ -664,7 +666,7 @@ func (c *client) do(method, key string, query url.Values, body []byte, extraHdr 
 		err      error
 	)
 	for attempt := 0; attempt < s3MaxAttempts; attempt++ {
-		if attempt > 0 && !time.Now().Before(deadline) {
+		if attempt > 0 && !c.clk.Now().Before(deadline) {
 			break // budget exhausted before this attempt could start
 		}
 		status, respBody, hdr, err = c.doOnce(method, key, query, body, extraHdr, deadline)
@@ -675,11 +677,11 @@ func (c *client) do(method, key string, query url.Values, body []byte, extraHdr 
 			break // node is shutting down; stop retrying
 		}
 		sleep := backoff + jitter(backoff)
-		if attempt == s3MaxAttempts-1 || time.Now().Add(sleep).After(deadline) {
+		if attempt == s3MaxAttempts-1 || c.clk.Now().Add(sleep).After(deadline) {
 			break
 		}
 		s3Retries.Inc()
-		time.Sleep(sleep)
+		c.clk.Sleep(sleep)
 		if backoff *= 2; backoff > s3MaxBackoff {
 			backoff = s3MaxBackoff
 		}
@@ -703,7 +705,7 @@ func (c *client) doOnce(method, key string, query url.Values, body []byte, extra
 		base = context.Background()
 	}
 	timeout := s3PerAttemptTimeout
-	if rem := time.Until(budgetDeadline); rem < timeout {
+	if rem := budgetDeadline.Sub(c.clk.Now()); rem < timeout {
 		timeout = rem // don't let a single attempt exceed the remaining budget
 	}
 	ctx, cancel := context.WithTimeout(base, timeout)
