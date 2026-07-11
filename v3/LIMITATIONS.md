@@ -118,6 +118,11 @@ itself would be the ideal key but is unreachable without editing `bootstrap.go`
   call. It reports success immediately without moving anything (which also lets
   graceful-shutdown transfer complete instead of blocking).
 
+- **The `raft.status` expvar is absent.** etcd's own `newRaftNode` also stores the node
+  in the package-level `etcdserver.raftStatus` indirection that backs the `/debug/vars`
+  `raft.status` entry. That symbol is unexported and unreachable from the `v3.NewRaftNode`
+  reconstruction, so the expvar is missing under s3raft. Debug-only; no functional impact.
+
 ## Configuration (security & notifier)
 
 Credentials resolve from `ETCD_S3LOG_{ACCESS,SECRET}_KEY`, then

@@ -98,13 +98,22 @@ func NewRaftNode(bp, ssp, walp, clp unsafe.Pointer) unsafe.Pointer {
 	w := (*wal.WAL)(walp)
 	cl := (*membership.RaftCluster)(clp)
 
+	// Use etcd's own configured logger (level, sinks, encoding) rather than
+	// manufacturing a fresh one per call via Logger(); Start re-names it "s3raft".
+	lg := b.lg.Named("s3raft")
+
 	// The etcd cluster ID, unavailable to the StartNode seam. Logged for now; a
 	// productionized version would thread it into ActiveNS as the namespace key.
-	Logger().Info("s3raft: newRaftNode has cluster ID",
+	lg.Info("s3raft: newRaftNode has cluster ID",
 		zap.String("cluster-id", cl.ID().String()),
 		zap.String("active-ns", ActiveNS))
 
-	n, err := Start(Logger(), os.Getenv(EnvURL), b.config.ID, ActiveNS, b.peers, b.storage)
+	// Deviation from etcd's own newRaftNode: it also stores the returned node in
+	// the package-level etcdserver.raftStatus indirection that backs the
+	// /debug/vars "raft.status" expvar. That symbol is unexported and
+	// unreachable from here, so the expvar is absent under s3raft. Harmless
+	// (debug-only) and documented in v3/LIMITATIONS.md; not a regression.
+	n, err := Start(b.lg, os.Getenv(EnvURL), b.config.ID, ActiveNS, b.peers, b.storage)
 	if err != nil {
 		panic(fmt.Sprintf("s3raft: start: %v", err))
 	}

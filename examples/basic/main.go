@@ -37,6 +37,15 @@ import (
 )
 
 func main() {
+	// Thin wrapper so every defer in run() (temp-dir cleanup, server/client
+	// close) unwinds before the process exits — a bare log.Fatal in the body
+	// would skip them.
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
 	if url := os.Getenv("ETCD_S3LOG_URL"); url != "" {
 		fmt.Printf("s3raft active: raft log stored at %s\n", url)
 	} else {
@@ -47,7 +56,7 @@ func main() {
 	// its state from the S3 log, so nothing needs to survive locally.
 	dir, err := os.MkdirTemp("", "libraft-basic-*")
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	defer os.RemoveAll(dir)
 
@@ -57,14 +66,14 @@ func main() {
 
 	e, err := embed.StartEtcd(cfg)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	defer e.Close()
 
 	select {
 	case <-e.Server.ReadyNotify():
 	case <-time.After(time.Minute):
-		log.Fatal("etcd took too long to start")
+		return fmt.Errorf("etcd took too long to start")
 	}
 
 	cli := v3client.New(e.Server)
@@ -80,11 +89,12 @@ func main() {
 	}
 
 	if _, err := cli.Put(ctx, "message", "hello from libraft"); err != nil {
-		log.Fatal(err)
+		return err
 	}
 	resp, err := cli.Get(ctx, "message")
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	fmt.Printf("wrote and read back: message=%q\n", resp.Kvs[0].Value)
+	return nil
 }

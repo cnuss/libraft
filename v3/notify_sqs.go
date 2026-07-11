@@ -54,18 +54,42 @@ type SQSNotifier struct {
 // same credential/region environment the S3 client uses, or returns nil if no
 // queue URL is configured.
 func newSQSNotifierFromEnv() *SQSNotifier {
-	q := firstEnv("ETCD_S3LOG_SQS_URL", "", "")
+	q := firstEnv("", "ETCD_S3LOG_SQS_URL")
 	if q == "" {
 		return nil
 	}
 	cr := awsCredsFromEnv()
+	// An explicitly configured region wins. Otherwise fall back to the queue
+	// host (sqs.<region>.amazonaws.com), which is authoritative for AWS, so a
+	// queue in a non-default region is signed correctly with no extra config.
+	region := cr.region
+	if firstEnv("", "ETCD_S3LOG_REGION", "AWS_REGION", "AWS_DEFAULT_REGION") == "" {
+		if r := regionFromSQSHost(q); r != "" {
+			region = r
+		}
+	}
 	return &SQSNotifier{
 		QueueURL:     q,
-		Region:       cr.region,
+		Region:       region,
 		AccessKey:    cr.accessKey,
 		SecretKey:    cr.secretKey,
 		SessionToken: cr.sessionToken,
 	}
+}
+
+// regionFromSQSHost extracts the region from an AWS SQS queue URL, whose host is
+// sqs.<region>.amazonaws.com. Returns "" for non-AWS hosts (e.g. LocalStack), so
+// the caller keeps its configured region.
+func regionFromSQSHost(queueURL string) string {
+	u, err := url.Parse(queueURL)
+	if err != nil {
+		return ""
+	}
+	parts := strings.Split(u.Host, ".")
+	if len(parts) >= 3 && parts[0] == "sqs" {
+		return parts[1]
+	}
+	return ""
 }
 
 // Watch long-polls the queue until ctx is cancelled, calling wake once per batch
