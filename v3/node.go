@@ -1153,63 +1153,86 @@ func (n *node) syncTail() {
 // epoch owner. Each read costs a small number of S3 GETs — the price of
 // linearizability without a replicated quorum.
 func (n *node) confirmRead() (uint64, bool) {
-	// Reachability gate: reading the epoch proves we can reach the store
-	// (closing the silent-partition stale-read hole) and surfaces whether a
-	// newer node has superseded our lease authority. Supersession demotes us
-	// for lease purposes but does not deny the read — the commit point is in
-	// S3, not in a leader, so we can still answer linearizably below.
-	d, err := n.cli.currentEpoch()
-	if err != nil {
+	// The reads a linearizable read needs are independent:
+	//   - currentEpoch (reachability + supersession gate)
+	//   - fetchTail    (the published committed tail)
+	//   - readHead     (etagChain mode only: the commit point that lives in HEAD
+	//                   before the per-index log object is published)
+	// None needs another's bytes, so fire them concurrently and fold the results
+	// on this goroutine — turning ~3 sequential round-trips into ~1. confirmRead
+	// runs on the run loop, which is parked at wg.Wait for the duration, so node
+	// state is stable and all mutation (bumpMaxTerm/checkFenced/ingest) still
+	// happens single-threaded on the loop after the reads complete.
+	base := n.lastIndex
+	chain := n.cli.chainMode()
+
+	var (
+		d    epochDoc
+		dErr error
+		tail []*raftpb.Entry
+		tErr error
+		h    head
+		hErr error
+		wg   sync.WaitGroup
+	)
+	wg.Add(2)
+	go func() { defer wg.Done(); d, dErr = n.cli.currentEpoch() }()
+	go func() { defer wg.Done(); tail, tErr = n.fetchTail(base) }()
+	if chain {
+		wg.Add(1)
+		go func() { defer wg.Done(); h, hErr = n.cli.readHead() }()
+	}
+	wg.Wait()
+
+	// Reachability + supersession gate. Supersession demotes us for lease
+	// purposes but does not deny the read — the commit point is in S3, not in a
+	// leader, so we can still answer linearizably below.
+	if dErr != nil {
 		readsDenied.Inc()
-		n.lg.Warn("s3raft: linearizable read denied — epoch check failed", zap.Error(err))
+		n.lg.Warn("s3raft: linearizable read denied — epoch check failed", zap.Error(dErr))
 		return 0, false
 	}
 	if d.Epoch > n.myEpoch {
 		n.bumpMaxTerm(d.Epoch)
 		n.checkFenced()
 	}
-	// Freshness gate: advance local state to the store's authoritative committed
-	// tail (including the commit point that lives only in HEAD, in etagChain
-	// mode, before the log object is published).
-	if err := n.syncToHead(); err != nil {
+
+	// Freshness gate: advance local state to the published committed tail.
+	if tErr != nil {
 		readsDenied.Inc()
-		n.lg.Warn("s3raft: linearizable read denied — tail sync failed", zap.Error(err))
+		n.lg.Warn("s3raft: linearizable read denied — tail sync failed", zap.Error(tErr))
 		return 0, false
 	}
-	return n.lastIndex, true
-}
-
-// syncToHead advances lastIndex to the store's authoritative committed index.
-// In etagChain mode the commit point is the HEAD pointer, which is advanced by
-// the If-Match CAS *before* the per-index log object is written (client.go); a
-// reader that only lists log/ objects would miss a committed-but-not-yet-
-// published (or crashed-mid-write) entry. So we read HEAD and, if it is ahead of
-// the published tail, recover the missing entries from HEAD.body. If we still
-// cannot reach HEAD.Index, we report an error so the read fails closed.
-func (n *node) syncToHead() error {
-	tail, err := n.fetchTail(n.lastIndex)
-	if err != nil {
-		return err
-	}
 	n.ingest(tail)
-	if !n.cli.chainMode() {
-		return nil // conditional mode: the log object IS the commit point
-	}
-	h, err := n.cli.readHead()
-	if err != nil {
-		return err
-	}
-	if h.Index > n.lastIndex && len(h.Entry) > 0 {
-		ents, derr := decodeEntries(h.Entry)
-		if derr != nil {
-			return derr
+
+	// etagChain mode: the commit point is the HEAD pointer, advanced by the
+	// If-Match CAS *before* the per-index log object is written (client.go). A
+	// reader that only lists log/ objects would miss a committed-but-not-yet-
+	// published (or crashed-mid-write) entry, so fold HEAD in after the tail and
+	// fail closed if we still cannot reach HEAD.Index.
+	if chain {
+		if hErr != nil {
+			readsDenied.Inc()
+			n.lg.Warn("s3raft: linearizable read denied — head read failed", zap.Error(hErr))
+			return 0, false
 		}
-		n.ingest(ents)
+		if h.Index > n.lastIndex && len(h.Entry) > 0 {
+			ents, derr := decodeEntries(h.Entry)
+			if derr != nil {
+				readsDenied.Inc()
+				n.lg.Warn("s3raft: linearizable read denied — corrupt head entry", zap.Error(derr))
+				return 0, false
+			}
+			n.ingest(ents)
+		}
+		if n.lastIndex < h.Index {
+			readsDenied.Inc()
+			n.lg.Warn("s3raft: linearizable read denied — could not reach committed index",
+				zap.Uint64("head-index", h.Index), zap.Uint64("local-tail", n.lastIndex))
+			return 0, false
+		}
 	}
-	if n.lastIndex < h.Index {
-		return fmt.Errorf("s3raft: could not reach committed index %d (local tail %d)", h.Index, n.lastIndex)
-	}
-	return nil
+	return n.lastIndex, true
 }
 
 // checkTail ingests any entries other writers appended to the shared log.
