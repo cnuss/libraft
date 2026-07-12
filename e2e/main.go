@@ -3,7 +3,7 @@
 // (etcdmain.Main). When ETCD_S3LOG_URL is set the installer hijacks etcd's
 // raft construction; unset, it is a byte-for-byte-behaving stock etcd.
 //
-// It exists only so etcd's e2e suite can drive an libraft-enabled binary
+// It exists only so etcd's e2e suite can drive a libraft-enabled binary
 // without editing etcd source. It shares this module with the e2e harness
 // (see go.mod) so etcdmain's dependency tree — and the harness's docker SDK —
 // never enter the root libraft module.
