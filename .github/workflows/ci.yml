@@ -244,30 +244,33 @@ jobs:
           ref: ${{ env.ETCD_REF }}
           path: etcd
 
-      - name: raise etcd ctl-test timeouts for the libraft barrier (hijacked modes)
-        if: matrix.mode != 'baseline'
-        working-directory: etcd
-        # etcdctl-driven tests derive their wrapper timeout from dialTimeout:
-        # getTestTimeout() = 2*dialTimeout + 1s (tests/e2e/ctl_v3_test.go). At the
-        # stock 7s that's 15s — fine for stock etcd, but every hijacked mode runs
-        # libraft's auth propagation barrier (node.go: ~1.5s held per auth write so
-        # peers pull the entry before a client reuses the token elsewhere).
-        # TestCtlV3AuthEndpointHealth alone does ~6 auth mutations (enable + user/
-        # role setup + grant) ≈ 9s of barrier, which overruns 15s regardless of the
-        # backend — reflect (MinIO) hit it even though MinIO ops are instant. Real
-        # S3 adds ~100ms/op on top. Bump the default so the derived wrapper (and
-        # etcdctl --dial-timeout, which prefixArgs sets from the same field) scale
-        # up to 2*60+1 = 121s. Fail loudly if the anchor line ever moves upstream
-        # rather than silently leaving 15s in place.
-        run: |
-          set -euo pipefail
-          # (1) ctl-test wrapper timeout: getTestTimeout() = 2*dialTimeout + 1s.
-          f=tests/e2e/ctl_v3_test.go
-          grep -q 'dialTimeout: 7 \* time.Second' "$f" \
-            || { echo "dialTimeout anchor not found in $f — etcd $ETCD_REF changed it; update this patch"; exit 1; }
-          sed -i 's/dialTimeout: 7 \* time.Second/dialTimeout: 60 * time.Second/' "$f"
-          grep -q 'dialTimeout: 60 \* time.Second' "$f" || { echo "dialTimeout patch did not apply"; exit 1; }
-          echo "patched $f: dialTimeout 7s -> 60s (ctl wrapper 15s -> 121s)"
+      # DISABLED (investigating whether the libraft barrier — not this ctl-test
+      # timeout patch — is the right lever). Left in place, commented, so the run
+      # exercises the stock 15s wrapper.
+      # - name: raise etcd ctl-test timeouts for the libraft barrier (hijacked modes)
+      #   if: matrix.mode != 'baseline'
+      #   working-directory: etcd
+      #   # etcdctl-driven tests derive their wrapper timeout from dialTimeout:
+      #   # getTestTimeout() = 2*dialTimeout + 1s (tests/e2e/ctl_v3_test.go). At the
+      #   # stock 7s that's 15s — fine for stock etcd, but every hijacked mode runs
+      #   # libraft's auth propagation barrier (node.go: ~1.5s held per auth write so
+      #   # peers pull the entry before a client reuses the token elsewhere).
+      #   # TestCtlV3AuthEndpointHealth alone does ~6 auth mutations (enable + user/
+      #   # role setup + grant) ≈ 9s of barrier, which overruns 15s regardless of the
+      #   # backend — reflect (MinIO) hit it even though MinIO ops are instant. Real
+      #   # S3 adds ~100ms/op on top. Bump the default so the derived wrapper (and
+      #   # etcdctl --dial-timeout, which prefixArgs sets from the same field) scale
+      #   # up to 2*60+1 = 121s. Fail loudly if the anchor line ever moves upstream
+      #   # rather than silently leaving 15s in place.
+      #   run: |
+      #     set -euo pipefail
+      #     # (1) ctl-test wrapper timeout: getTestTimeout() = 2*dialTimeout + 1s.
+      #     f=tests/e2e/ctl_v3_test.go
+      #     grep -q 'dialTimeout: 7 \* time.Second' "$f" \
+      #       || { echo "dialTimeout anchor not found in $f — etcd $ETCD_REF changed it; update this patch"; exit 1; }
+      #     sed -i 's/dialTimeout: 7 \* time.Second/dialTimeout: 60 * time.Second/' "$f"
+      #     grep -q 'dialTimeout: 60 \* time.Second' "$f" || { echo "dialTimeout patch did not apply"; exit 1; }
+      #     echo "patched $f: dialTimeout 7s -> 60s (ctl wrapper 15s -> 121s)"
 
       - name: setup go
         uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
