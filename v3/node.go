@@ -34,7 +34,7 @@ import (
 	"go.etcd.io/raft/v3/tracker"
 )
 
-// envURL is the switch: when non-empty, s3raft takes over consensus.
+// envURL is the switch: when non-empty, libraft takes over consensus.
 const EnvURL = "ETCD_S3LOG_URL"
 
 var _ raft.Node = &node{}
@@ -102,7 +102,7 @@ type node struct {
 	voters map[uint64]struct{}
 
 	// Fencing epoch state (also owned by run()). myEpoch is the epoch this
-	// node claimed at boot by CAS-bumping meta/epoch — the s3raft analog
+	// node claimed at boot by CAS-bumping meta/epoch — the libraft analog
 	// of winning a raft election; every entry we write is stamped with the
 	// highest term we have seen. Observing any entry with a term above
 	// myEpoch means a newer node has since claimed the epoch: we demote
@@ -176,7 +176,7 @@ const fenceCheckInterval = time.Second
 const genesisEpoch = 1
 
 // heartbeatInterval is how often the node emits no-op MsgHeartbeat to its peers.
-// s3raft exchanges no real raft traffic, so without these etcd's rafthttp
+// libraft exchanges no real raft traffic, so without these etcd's rafthttp
 // transport never marks peers "active" and reconfiguration health gates
 // (isConnectedToQuorumAfterAddingNewMemberSince, gated on HealthInterval) reject
 // member changes with "unhealthy cluster". Kept well under etcd's HealthInterval
@@ -257,7 +257,7 @@ func (n *node) seedGenesis(peers []raft.Peer) error {
 	n.lead = designated
 	n.isLeader = false
 	n.pendingSoft = &raft.SoftState{Lead: designated, RaftState: raft.StateFollower}
-	n.lg.Info("s3raft: genesis follower of designated (lowest-id) leader",
+	n.lg.Info("libraft: genesis follower of designated (lowest-id) leader",
 		zap.String("leader", fmt.Sprintf("%x", designated)))
 	return nil
 }
@@ -284,7 +284,7 @@ func Start(lg *zap.Logger, rawurl string, id uint64, nsKey string, peers []raft.
 	}
 
 	n := &node{
-		lg:          lg.Named("s3raft"),
+		lg:          lg.Named("libraft"),
 		id:          id,
 		cli:         cli,
 		clk:         realClock{},
@@ -328,7 +328,7 @@ func Start(lg *zap.Logger, rawurl string, id uint64, nsKey string, peers []raft.
 		n.stableIndex = restoredIndex
 		n.lastIndex = restoredIndex
 		n.bootSnap = pendingSnapshot // emitted first to fast-forward etcd
-		n.lg.Info("s3raft: resuming replay past restored snapshot",
+		n.lg.Info("libraft: resuming replay past restored snapshot",
 			zap.Uint64("restored-index", restoredIndex))
 	}
 
@@ -345,15 +345,15 @@ func Start(lg *zap.Logger, rawurl string, id uint64, nsKey string, peers []raft.
 	// compacted-away prefix (base=0 keeps the full history in the log).
 	if forceNewApplied && li > 0 {
 		if perr := n.publishLocalEntries(ms, fi, li); perr != nil {
-			return nil, fmt.Errorf("s3raft: force-new-cluster: %w", perr)
+			return nil, fmt.Errorf("libraft: force-new-cluster: %w", perr)
 		}
 		if base > 0 {
 			if serr := n.uploadSnapshot(cli, li); serr != nil {
-				return nil, fmt.Errorf("s3raft: force-new-cluster: publish restore snapshot at %d: %w", li, serr)
+				return nil, fmt.Errorf("libraft: force-new-cluster: publish restore snapshot at %d: %w", li, serr)
 			}
 			n.lastCheckpoint = li
 		}
-		n.lg.Warn("s3raft: --force-new-cluster: republished local WAL as new genesis history",
+		n.lg.Warn("libraft: --force-new-cluster: republished local WAL as new genesis history",
 			zap.Uint64("entries", li), zap.Uint64("from-index", base))
 	}
 
@@ -403,7 +403,7 @@ func Start(lg *zap.Logger, rawurl string, id uint64, nsKey string, peers []raft.
 			n.lead = d.Owner
 			n.isLeader = false
 			n.pendingSoft = &raft.SoftState{Lead: d.Owner, RaftState: raft.StateFollower}
-			n.lg.Info("s3raft: joined existing cluster — following epoch owner",
+			n.lg.Info("libraft: joined existing cluster — following epoch owner",
 				zap.Bool("learner", learner),
 				zap.Uint64("epoch", d.Epoch),
 				zap.String("owner", fmt.Sprintf("%x", d.Owner)))
@@ -428,11 +428,11 @@ func Start(lg *zap.Logger, rawurl string, id uint64, nsKey string, peers []raft.
 	}
 	if s3idx < n.lastIndex {
 		if s3idx != 0 && !forceNewBoot {
-			return nil, fmt.Errorf("s3raft: local state (index %d) is ahead of a non-empty shared log (index %d); the shared log is authoritative — restore the bucket, not a local snapshot", n.lastIndex, s3idx)
+			return nil, fmt.Errorf("libraft: local state (index %d) is ahead of a non-empty shared log (index %d); the shared log is authoritative — restore the bucket, not a local snapshot", n.lastIndex, s3idx)
 		}
 		if s3idx == 0 {
 			if serr := n.seedLogFromLocal(n.lastIndex); serr != nil {
-				return nil, fmt.Errorf("s3raft: bootstrap shared log from restored state: %w", serr)
+				return nil, fmt.Errorf("libraft: bootstrap shared log from restored state: %w", serr)
 			}
 		} else {
 			// --force-new-cluster boot after the initial purge: this member's
@@ -442,13 +442,13 @@ func Start(lg *zap.Logger, rawurl string, id uint64, nsKey string, peers []raft.
 			// The one-shot marker suppressed a re-purge, so heal the divergence
 			// by publishing the local tail rather than failing.
 			if serr := n.publishLocalEntries(ms, s3idx+1, n.lastIndex); serr != nil {
-				return nil, fmt.Errorf("s3raft: force-new-cluster: heal shared log: %w", serr)
+				return nil, fmt.Errorf("libraft: force-new-cluster: heal shared log: %w", serr)
 			}
-			n.lg.Warn("s3raft: --force-new-cluster: healed shared log from local tail",
+			n.lg.Warn("libraft: --force-new-cluster: healed shared log from local tail",
 				zap.Uint64("from", s3idx+1), zap.Uint64("to", n.lastIndex))
 		}
 	} else if s3idx == 0 && n.lastIndex == 0 && len(peers) == 0 {
-		return nil, fmt.Errorf("s3raft: no shared log for this namespace and no local state — adding a member to a running s3raft cluster is unsupported; provision all members at cluster creation (see LIMITATIONS.md)")
+		return nil, fmt.Errorf("libraft: no shared log for this namespace and no local state — adding a member to a running libraft cluster is unsupported; provision all members at cluster creation (see LIMITATIONS.md)")
 	}
 
 	// Append the leader no-op entry, mirroring what a freshly elected raft
@@ -459,11 +459,11 @@ func Start(lg *zap.Logger, rawurl string, id uint64, nsKey string, peers []raft.
 	// (run() has not started yet, so calling appendBatch directly is safe.)
 	if n.isLeader {
 		if err := n.appendBatch([]proposal{{typ: raftpb.EntryNormal}}); err != nil {
-			return nil, fmt.Errorf("s3raft: leader no-op append: %w", err)
+			return nil, fmt.Errorf("libraft: leader no-op append: %w", err)
 		}
 	}
 
-	n.lg.Info("s3raft node started",
+	n.lg.Info("libraft node started",
 		zap.String("member-id", fmt.Sprintf("%x", id)),
 		zap.String("bucket", cli.bucket),
 		zap.Bool("leader", n.isLeader),
@@ -491,7 +491,7 @@ func Start(lg *zap.Logger, rawurl string, id uint64, nsKey string, peers []raft.
 	return n, nil
 }
 
-// claimEpoch CAS-bumps meta/epoch and takes leadership — the s3raft "election".
+// claimEpoch CAS-bumps meta/epoch and takes leadership — the libraft "election".
 // This node is leader until a node with a higher epoch announces itself through
 // the log. Only voting members (genesis or a promoted/voter join) may claim;
 // learners must not (see start()).
@@ -634,7 +634,7 @@ func (n *node) fetchTail(after uint64) ([]*raftpb.Entry, error) {
 	for i, k := range logKeys {
 		batch, derr := decodeEntries(bodies[i])
 		if derr != nil {
-			return nil, fmt.Errorf("s3raft: corrupt log object %s: %w", k, derr)
+			return nil, fmt.Errorf("libraft: corrupt log object %s: %w", k, derr)
 		}
 		ents = append(ents, batch...)
 	}
@@ -668,7 +668,7 @@ func (n *node) committedLogIndex() (uint64, error) {
 // seedLogFromLocal bootstraps an empty shared log from restored local state at
 // `index`: it publishes a bucket snapshot of the restored backend at that index
 // (so future members restore from it) and advances the log's committed pointer
-// to index. With s3raft the log is the source of truth, but a local snapshot
+// to index. With libraft the log is the source of truth, but a local snapshot
 // restore leaves the backend ahead of an empty log; this reconciles them for a
 // genuine fresh cluster (single member, empty log). A non-empty log is rejected
 // by the caller instead of seeded, to avoid diverging from agreed history.
@@ -685,7 +685,7 @@ func (n *node) seedLogFromLocal(index uint64) error {
 			return err
 		}
 	}
-	n.lg.Info("s3raft: bootstrapped shared log from restored local state",
+	n.lg.Info("libraft: bootstrapped shared log from restored local state",
 		zap.Uint64("index", index))
 	return nil
 }
@@ -736,7 +736,7 @@ func (n *node) ingest(ents []*raftpb.Entry) {
 			continue
 		}
 		if idx != n.lastIndex+1 && idx > n.lastIndex {
-			n.lg.Warn("s3raft: gap in log, refetching later",
+			n.lg.Warn("libraft: gap in log, refetching later",
 				zap.Uint64("expected", n.lastIndex+1), zap.Uint64("got", idx))
 			return
 		}
@@ -778,7 +778,7 @@ func (n *node) startFenceRead() {
 // here). Mirrors the old synchronous checkEpoch after the read.
 func (n *node) applyEpoch(r readResult) {
 	if r.dErr != nil {
-		n.lg.Warn("s3raft: epoch freshness check failed", zap.Error(r.dErr))
+		n.lg.Warn("libraft: epoch freshness check failed", zap.Error(r.dErr))
 		return
 	}
 	d := r.d
@@ -799,7 +799,7 @@ func (n *node) applyEpoch(r readResult) {
 	if d.Owner != raft.None && d.Owner != n.id && d.Owner != n.lead {
 		n.lead = d.Owner
 		n.pendingSoft = &raft.SoftState{Lead: d.Owner, RaftState: raft.StateFollower}
-		n.lg.Info("s3raft: follower tracking new epoch owner",
+		n.lg.Info("libraft: follower tracking new epoch owner",
 			zap.Uint64("epoch", d.Epoch),
 			zap.String("leader", fmt.Sprintf("%x", d.Owner)))
 	}
@@ -819,11 +819,11 @@ func (n *node) checkFenced() {
 	if d, err := n.cli.currentEpoch(); err == nil {
 		lead = d.Owner
 	} else {
-		n.lg.Warn("s3raft: could not resolve epoch owner on demotion", zap.Error(err))
+		n.lg.Warn("libraft: could not resolve epoch owner on demotion", zap.Error(err))
 	}
 	n.lead = lead
 	n.pendingSoft = &raft.SoftState{Lead: lead, RaftState: raft.StateFollower}
-	n.lg.Info("s3raft: fenced — higher epoch observed, demoting to follower",
+	n.lg.Info("libraft: fenced — higher epoch observed, demoting to follower",
 		zap.Uint64("my-epoch", n.myEpoch),
 		zap.Uint64("observed-term", n.maxTerm),
 		zap.String("new-leader", fmt.Sprintf("%x", lead)),
@@ -1030,7 +1030,7 @@ drain:
 	if err == nil && addsMember(batch) {
 		// Propagation barrier. A member add is committed the instant its log
 		// object is CAS-written, but peers learn of it only by *pulling* the
-		// shared log (s3raft sends no raft traffic), so an existing member can
+		// shared log (libraft sends no raft traffic), so an existing member can
 		// still be serving a membership view that predates this add. etcd's
 		// MemberAdd returns as soon as *this* node applies the ConfChange, and
 		// the caller immediately starts the new member, which validates its
@@ -1135,7 +1135,7 @@ func (n *node) appendBatch(batch []proposal) error {
 		}
 		n.ingest(tail)
 	}
-	return fmt.Errorf("s3raft: propose: too many CAS conflicts")
+	return fmt.Errorf("libraft: propose: too many CAS conflicts")
 }
 
 // Conflict backoff bounds for the CAS retry loops (appendBatch's lost-race
@@ -1183,9 +1183,9 @@ func (n *node) syncTail() {
 // authority cannot be positively confirmed: an S3 error/partition leaves us
 // unable to prove freshness.
 //
-// This is the s3raft analog of raft's ReadIndex, but simpler. Real raft must
+// This is the libraft analog of raft's ReadIndex, but simpler. Real raft must
 // route a linearizable read through the leader, because only the leader knows
-// the commit index; a follower has to forward. s3raft externalizes the commit
+// the commit index; a follower has to forward. libraft externalizes the commit
 // point to S3, so *any* reachable node can serve a linearizable read: it proves
 // (a) it can still reach the store and (b) advances to the store's true
 // committed index, then answers. Leadership (the fencing epoch) governs lease
@@ -1271,7 +1271,7 @@ func (n *node) applyReadResult(r readResult) {
 	case readTail:
 		n.tailInFlight = false
 		if r.tErr != nil {
-			n.lg.Warn("s3raft: tail check failed", zap.Error(r.tErr))
+			n.lg.Warn("libraft: tail check failed", zap.Error(r.tErr))
 			return
 		}
 		if len(r.tail) > 0 {
@@ -1294,7 +1294,7 @@ func (n *node) applyLinRead(r readResult) (uint64, bool) {
 	// leader, so we can still answer linearizably below.
 	if r.dErr != nil {
 		readsDenied.Inc()
-		n.lg.Warn("s3raft: linearizable read denied — epoch check failed", zap.Error(r.dErr))
+		n.lg.Warn("libraft: linearizable read denied — epoch check failed", zap.Error(r.dErr))
 		return 0, false
 	}
 	if r.d.Epoch > n.myEpoch {
@@ -1305,7 +1305,7 @@ func (n *node) applyLinRead(r readResult) (uint64, bool) {
 	// Freshness gate: advance local state to the published committed tail.
 	if r.tErr != nil {
 		readsDenied.Inc()
-		n.lg.Warn("s3raft: linearizable read denied — tail sync failed", zap.Error(r.tErr))
+		n.lg.Warn("libraft: linearizable read denied — tail sync failed", zap.Error(r.tErr))
 		return 0, false
 	}
 	n.ingest(r.tail)
@@ -1318,21 +1318,21 @@ func (n *node) applyLinRead(r readResult) (uint64, bool) {
 	if r.chain {
 		if r.hErr != nil {
 			readsDenied.Inc()
-			n.lg.Warn("s3raft: linearizable read denied — head read failed", zap.Error(r.hErr))
+			n.lg.Warn("libraft: linearizable read denied — head read failed", zap.Error(r.hErr))
 			return 0, false
 		}
 		if r.h.Index > n.lastIndex && len(r.h.Entry) > 0 {
 			ents, derr := decodeEntries(r.h.Entry)
 			if derr != nil {
 				readsDenied.Inc()
-				n.lg.Warn("s3raft: linearizable read denied — corrupt head entry", zap.Error(derr))
+				n.lg.Warn("libraft: linearizable read denied — corrupt head entry", zap.Error(derr))
 				return 0, false
 			}
 			n.ingest(ents)
 		}
 		if n.lastIndex < r.h.Index {
 			readsDenied.Inc()
-			n.lg.Warn("s3raft: linearizable read denied — could not reach committed index",
+			n.lg.Warn("libraft: linearizable read denied — could not reach committed index",
 				zap.Uint64("head-index", r.h.Index), zap.Uint64("local-tail", n.lastIndex))
 			return 0, false
 		}
@@ -1369,7 +1369,7 @@ func (n *node) poke() {
 func (n *node) watchLog(ctx context.Context) {
 	notifier := notifierFor(n.cli, "log/")
 	if err := notifier.Watch(ctx, n.poke); err != nil && ctx.Err() == nil {
-		n.lg.Info("s3raft: log-change notifications unavailable; using poll only",
+		n.lg.Info("libraft: log-change notifications unavailable; using poll only",
 			zap.Error(err))
 	}
 }

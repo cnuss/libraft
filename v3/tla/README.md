@@ -1,4 +1,4 @@
-# s3raft formal model
+# libraft formal model
 
 `S3RaftCAS.tla` is a TLA+ model of the etagChain compare-and-swap append
 protocol in `../client.go` (`appendCAS`). It models the single primitive the

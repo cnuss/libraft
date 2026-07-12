@@ -23,7 +23,7 @@
 // step this does not cover.
 //
 // Run against a running MinIO:
-//   ETCD_S3RAFT_MINIO_URL=http://localhost:9000/lintest \
+//   ETCD_LIBRAFT_MINIO_URL=http://localhost:9000/lintest \
 //     go test -tags linearizability -run TestCASLinearizability \
 //     -v ./server/etcdserver/s3raft/
 
@@ -110,9 +110,9 @@ func tailIndex(cli *client) (uint64, error) {
 }
 
 func TestCASLinearizability(t *testing.T) {
-	url := os.Getenv("ETCD_S3RAFT_MINIO_URL")
+	url := os.Getenv("ETCD_LIBRAFT_MINIO_URL")
 	if url == "" {
-		t.Skip("set ETCD_S3RAFT_MINIO_URL (e.g. http://localhost:9000/lintest) to run")
+		t.Skip("set ETCD_LIBRAFT_MINIO_URL (e.g. http://localhost:9000/lintest) to run")
 	}
 
 	cli, err := newClient(url)

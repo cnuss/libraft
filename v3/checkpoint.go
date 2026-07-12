@@ -126,7 +126,7 @@ type memberProgress struct {
 // the bucket when the local one is missing (disk-wiped recovery), opens the
 // backend, and captures it for the checkpointer.
 func S3OpenBackend(cfg config.ServerConfig, hooks backend.Hooks) backend.Backend {
-	lg := Logger()
+	lg := Logger().Named("libraft")
 	guardConfig(lg, cfg)
 	ActiveNS = resolveNS(lg, cfg)
 	forceNewClusterPurge(lg, cfg)
@@ -134,7 +134,7 @@ func S3OpenBackend(cfg config.ServerConfig, hooks backend.Hooks) backend.Backend
 	path := cfg.BackendPath()
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		if rerr := prepareRestore(lg, cfg); rerr != nil {
-			lg.Warn("s3raft: backend restore from bucket failed; starting empty", zap.Error(rerr))
+			lg.Warn("libraft: backend restore from bucket failed; starting empty", zap.Error(rerr))
 		}
 	}
 
@@ -143,17 +143,17 @@ func S3OpenBackend(cfg config.ServerConfig, hooks backend.Hooks) backend.Backend
 	return be
 }
 
-// guardConfig turns settings s3raft cannot honor into automatic startup
+// guardConfig turns settings libraft cannot honor into automatic startup
 // checks, so correctness no longer depends on operator discipline. It runs once,
 // from the OpenBackend hijack, where the full server config is available.
 func guardConfig(lg *zap.Logger, cfg config.ServerConfig) {
 	// The periodic corruption check asserts the leader's revision is >= every
-	// follower's — a single-leader raft invariant s3raft breaks (a fenced peer
+	// follower's — a single-leader raft invariant libraft breaks (a fenced peer
 	// that just applied is routinely ahead of the epoch owner), so it would raise
 	// a false CORRUPT alarm and halt writes cluster-wide. It is off by default;
 	// refuse to start when it is enabled rather than boot into that time bomb.
 	if cfg.CorruptCheckTime > 0 {
-		lg.Fatal("s3raft: periodic corruption check is incompatible with s3raft "+
+		lg.Fatal("libraft: periodic corruption check is incompatible with libraft "+
 			"(it asserts a single-leader revision ordering that the shared log violates, "+
 			"raising a false CORRUPT alarm); set --corrupt-check-time to 0",
 			zap.Duration("corrupt-check-time", cfg.CorruptCheckTime))
@@ -163,11 +163,11 @@ func guardConfig(lg *zap.Logger, cfg config.ServerConfig) {
 	// keepalive delivered to a node during its pre-demotion window while the true
 	// epoch owner expires it. etcd clamps every grant up to
 	// MinLeaseTTL = ceil((3*ElectionTicks/2) * TickMs) (server.go); warn when that
-	// floor does not clear fenceCheckInterval, since s3raft cannot raise it here.
+	// floor does not clear fenceCheckInterval, since libraft cannot raise it here.
 	heartbeat := time.Duration(cfg.TickMs) * time.Millisecond
 	minLeaseTTL := time.Duration((3*cfg.ElectionTicks)/2) * heartbeat
 	if minLeaseTTL <= fenceCheckInterval {
-		lg.Warn("s3raft: minimum lease TTL is at or below the fencing-detection window; "+
+		lg.Warn("libraft: minimum lease TTL is at or below the fencing-detection window; "+
 			"a keepalive to a fenced node can extend a lease the epoch owner has expired — "+
 			"raise --heartbeat-interval and/or --election-timeout so the floor exceeds it",
 			zap.Duration("min-lease-ttl", minLeaseTTL),
@@ -178,16 +178,16 @@ func guardConfig(lg *zap.Logger, cfg config.ServerConfig) {
 // forceNewClusterMarker is the sentinel file recording that a --force-new-cluster
 // purge has already run for this member, so leaving the flag in a boot unit does
 // not re-wipe the shared log on every restart.
-const forceNewClusterMarker = "s3raft-force-new-done"
+const forceNewClusterMarker = "libraft-force-new-done"
 
-// forceNewClusterPurge implements --force-new-cluster for s3raft. etcd's own
-// force-new rewrites the local WAL to a single-member config; under s3raft the
+// forceNewClusterPurge implements --force-new-cluster for libraft. etcd's own
+// force-new rewrites the local WAL to a single-member config; under libraft the
 // authority is the shared S3 log, so the equivalent recovery is to WIPE this
 // cluster's namespace and let the local backend re-seed it as a fresh genesis
 // (start() sees an empty log, claims the epoch, and seedLogFromLocal rebuilds
 // the log from local state).
 //
-// This is destructive and irreversible, and s3raft cannot verify the other
+// This is destructive and irreversible, and libraft cannot verify the other
 // members are actually dead — only run it when quorum is permanently lost. Two
 // guards keep the footguns in check: the purge is scoped strictly to this
 // cluster's namespace (never the whole bucket), and a one-shot marker in the
@@ -199,7 +199,7 @@ func forceNewClusterPurge(lg *zap.Logger, cfg config.ServerConfig) {
 	forceNewBoot = true
 	marker := filepath.Join(cfg.MemberDir(), forceNewClusterMarker)
 	if _, err := os.Stat(marker); err == nil {
-		lg.Warn("s3raft: --force-new-cluster already applied for this member; skipping purge " +
+		lg.Warn("libraft: --force-new-cluster already applied for this member; skipping purge " +
 			"(remove the force-new-cluster flag from your boot config; to force again, delete " +
 			marker + ")")
 		return
@@ -207,20 +207,20 @@ func forceNewClusterPurge(lg *zap.Logger, cfg config.ServerConfig) {
 
 	cli, err := checkpointClient()
 	if err != nil {
-		lg.Fatal("s3raft: --force-new-cluster: cannot reach the shared log to purge it", zap.Error(err))
+		lg.Fatal("libraft: --force-new-cluster: cannot reach the shared log to purge it", zap.Error(err))
 	}
-	lg.Warn("s3raft: --force-new-cluster: WIPING this cluster's shared log namespace; " +
+	lg.Warn("libraft: --force-new-cluster: WIPING this cluster's shared log namespace; " +
 		"the local backend will re-seed it as a fresh genesis — only valid when quorum is " +
 		"permanently lost (surviving members pointed at this namespace will break)")
 	n, err := cli.purgeNamespace()
 	if err != nil {
-		lg.Fatal("s3raft: --force-new-cluster: purge failed", zap.Error(err))
+		lg.Fatal("libraft: --force-new-cluster: purge failed", zap.Error(err))
 	}
 	if werr := os.WriteFile(marker, []byte("force-new-cluster applied\n"), 0o600); werr != nil {
-		lg.Fatal("s3raft: --force-new-cluster: could not write one-shot marker", zap.Error(werr))
+		lg.Fatal("libraft: --force-new-cluster: could not write one-shot marker", zap.Error(werr))
 	}
 	forceNewApplied = true
-	lg.Warn("s3raft: --force-new-cluster: shared log purged",
+	lg.Warn("libraft: --force-new-cluster: shared log purged",
 		zap.Int("objects-deleted", n),
 		zap.String("marker", marker))
 }
@@ -249,7 +249,7 @@ func backendConfig(cfg config.ServerConfig, hooks backend.Hooks) backend.Backend
 
 // nsFile is where the resolved namespace is cached inside the member dir.
 func nsFile(cfg config.ServerConfig) string {
-	return filepath.Join(cfg.MemberDir(), "s3raft-ns")
+	return filepath.Join(cfg.MemberDir(), "libraft-ns")
 }
 
 // resolveNS returns the bucket namespace for this member, cached in the data
@@ -267,7 +267,7 @@ func resolveNS(lg *zap.Logger, cfg config.ServerConfig) string {
 	// MemberDir exists by the time OpenBackend runs (etcd created snap/ under
 	// it); persist best-effort so the next restart reuses this exact prefix.
 	if err := os.WriteFile(f, []byte(ns), 0o600); err != nil {
-		lg.Warn("s3raft: persist namespace failed", zap.Error(err), zap.String("path", f))
+		lg.Warn("libraft: persist namespace failed", zap.Error(err), zap.String("path", f))
 	}
 	return ns
 }
@@ -387,7 +387,7 @@ func prepareRestore(lg *zap.Logger, cfg config.ServerConfig) error {
 			ConfState: &raftpb.ConfState{Voters: meta.Voters},
 		},
 	}
-	lg.Info("s3raft: staged bucket snapshot for restore",
+	lg.Info("libraft: staged bucket snapshot for restore",
 		zap.Uint64("snapshot-index", meta.Index),
 		zap.Uint64("snapshot-term", meta.Term),
 		zap.Int("bytes", len(db)),
@@ -398,7 +398,7 @@ func prepareRestore(lg *zap.Logger, cfg config.ServerConfig) error {
 // checkpointClient builds an S3 client scoped to the active namespace.
 func checkpointClient() (*client, error) {
 	if ActiveNS == "" {
-		return nil, fmt.Errorf("s3raft: checkpoint namespace not set")
+		return nil, fmt.Errorf("libraft: checkpoint namespace not set")
 	}
 	return openStore(os.Getenv(EnvURL), ActiveNS)
 }
@@ -412,7 +412,7 @@ func readCheckpointMeta(cli store) (checkpointMeta, error) {
 		return m, err
 	}
 	if err := json.Unmarshal(raw, &m); err != nil {
-		return m, fmt.Errorf("s3raft: corrupt checkpoint meta: %w", err)
+		return m, fmt.Errorf("libraft: corrupt checkpoint meta: %w", err)
 	}
 	return m, nil
 }
@@ -423,12 +423,12 @@ func readCheckpointMeta(cli store) (checkpointMeta, error) {
 // own progress so the truncation floor respects the slowest member.
 func (n *node) runCheckpointer() {
 	if capturedBackend == nil {
-		n.lg.Warn("s3raft: no captured backend; checkpointer disabled")
+		n.lg.Warn("libraft: no captured backend; checkpointer disabled")
 		return
 	}
 	cli, err := checkpointClient()
 	if err != nil {
-		n.lg.Warn("s3raft: checkpointer disabled", zap.Error(err))
+		n.lg.Warn("libraft: checkpointer disabled", zap.Error(err))
 		return
 	}
 	cli.baseCtx = n.bgCtx // abort in-flight snapshot upload on shutdown
@@ -460,7 +460,7 @@ func (n *node) checkpoint(cli *client) {
 	// Publish this member's progress for the shared truncation floor.
 	if body, merr := json.Marshal(memberProgress{SnapshotIndex: localSnap}); merr == nil {
 		if perr := cli.put(progressKey(n.id), body); perr != nil {
-			n.lg.Warn("s3raft: publish progress failed", zap.Error(perr))
+			n.lg.Warn("libraft: publish progress failed", zap.Error(perr))
 		}
 	}
 
@@ -474,7 +474,7 @@ func (n *node) checkpoint(cli *client) {
 	}
 
 	if err := n.uploadSnapshot(cli, localSnap); err != nil {
-		n.lg.Warn("s3raft: snapshot upload failed", zap.Error(err))
+		n.lg.Warn("libraft: snapshot upload failed", zap.Error(err))
 		return
 	}
 	n.lastCheckpoint = localSnap
@@ -509,7 +509,7 @@ func (n *node) pruneProgress(cli store) []string {
 		if id, ok := parseProgressKey(k); ok {
 			if _, member := voters[id]; !member {
 				if derr := cli.del(k); derr == nil {
-					n.lg.Info("s3raft: pruned departed member progress",
+					n.lg.Info("libraft: pruned departed member progress",
 						zap.String("member-id", fmt.Sprintf("%x", id)))
 					continue // dropped; not a survivor
 				}
@@ -526,7 +526,7 @@ func (n *node) pruneProgress(cli store) []string {
 func (n *node) uploadSnapshot(cli store, index uint64) error {
 	src := snapshotSource()
 	if src == nil {
-		return fmt.Errorf("s3raft: no captured backend to snapshot")
+		return fmt.Errorf("libraft: no captured backend to snapshot")
 	}
 	snap := src.Snapshot()
 	defer snap.Close()
@@ -546,7 +546,7 @@ func (n *node) uploadSnapshot(cli store, index uint64) error {
 	if err := cli.put("snap/meta", meta); err != nil {
 		return err
 	}
-	n.lg.Info("s3raft: wrote bucket snapshot",
+	n.lg.Info("libraft: wrote bucket snapshot",
 		zap.Uint64("index", index), zap.Int("bytes", buf.Len()))
 
 	// GC older snapshot db objects, but retain the immediately-previous one:
@@ -591,7 +591,7 @@ func (n *node) truncateLog(cli store, progressKeys []string) {
 		}
 	}
 	if deleted > 0 {
-		n.lg.Info("s3raft: truncated log",
+		n.lg.Info("libraft: truncated log",
 			zap.Uint64("cutoff-index", cutoff), zap.Int("deleted", deleted))
 	}
 }

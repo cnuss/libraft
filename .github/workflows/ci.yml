@@ -115,7 +115,7 @@ jobs:
   # compares:
   #
   #   baseline — stock etcd (built from the pinned etcd checkout), no hijack.
-  #   reflect  — stock etcd + the s3raft installer blank-imported (e2e/main.go),
+  #   reflect  — stock etcd + the libraft installer blank-imported (e2e/main.go),
   #              ETCD_S3LOG_URL pointed at a MinIO container.
   #
   # The hijacked binary is stock etcd with one blank import (etcdmain.Main is
@@ -124,14 +124,14 @@ jobs:
   # from <etcd>/bin/etcd, so the reflect leg just overwrites that one file.
   #
   # A test failure fails the step (pipefail + no continue-on-error). Both legs
-  # run the E2E_SUBSET below — the slice of etcd's own suite s3raft is known to
+  # run the E2E_SUBSET below — the slice of etcd's own suite libraft is known to
   # pass (single-node + a real multi-member cluster), so both gate green.
-  # s3raft documents whole classes of e2e as unsupported (leader transfer,
+  # libraft documents whole classes of e2e as unsupported (leader transfer,
   # simultaneous discovery bootstrap, periodic corruption check, force-new);
   # those are excluded from the subset and only run when E2E_SUBSET is cleared
   # via the e2e-full input on a manual workflow_dispatch run. Baseline proves
   # the harness itself works; the baseline-vs-reflect diff is the map of what
-  # s3raft supports (issue #20).
+  # libraft supports (issue #20).
   #
   # This used to be its own workflow gated by on.<event>.paths; folded in here
   # that filter would gate ALL of CI, so the path gate moved into the changes
@@ -182,7 +182,7 @@ jobs:
       # go.etcd.io/etcd/server/v3 version in go.mod / e2e/go.mod).
       ETCD_REF: v3.7.0
       # Both PRs and main run the SAME fast, high-value subset of etcd's OWN
-      # suite that s3raft is known to pass (confirmed against the full run in
+      # suite that libraft is known to pass (confirmed against the full run in
       # issue #20) — enough to prove a CLUSTER stays functional through the S3
       # log, not just a single node:
       #   single-node functional: KV, txn, lease, watch, compaction, auth, elect, lock
@@ -294,7 +294,7 @@ jobs:
           # etcd's own scripts/test.sh exports ETCD_VERIFY=all for every e2e
           # run — it turns on the server's internal consistency/hash checks
           # during tests. Match it: baseline then mirrors etcd's real CI, and
-          # the reflect leg gets a stronger assertion that s3raft doesn't leave
+          # the reflect leg gets a stronger assertion that libraft doesn't leave
           # bbolt state etcd's verifier would reject.
           ETCD_VERIFY: all
           # Only set for the reflect leg; the spawned etcd inherits this env, so

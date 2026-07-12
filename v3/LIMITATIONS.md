@@ -1,6 +1,6 @@
-# s3raft known limitations & safety notes
+# libraft known limitations & safety notes
 
-s3raft replaces raft with a shared S3 CAS log: every node runs its own etcd
+libraft replaces raft with a shared S3 CAS log: every node runs its own etcd
 apply loop over the same totally-ordered log, so anything computed at apply time
 (revision, compactRevision, consistentIndex, auth revision, alarm state) is a
 deterministic function of the log and stays identical across nodes. The items
@@ -9,16 +9,16 @@ same S3-CAS-ordered log — needs care or falls short.
 
 ## Guarded by startup checks
 
-s3raft validates these at boot (`guardConfig`, checkpoint.go), so correctness no
+libraft validates these at boot (`guardConfig`, checkpoint.go), so correctness no
 longer depends on operator discipline:
 
-- **Periodic corruption check is INCOMPATIBLE — s3raft refuses to start with it on.**
+- **Periodic corruption check is INCOMPATIBLE — libraft refuses to start with it on.**
   `corrupt.go`'s `PeriodicCheck` asserts the leader's revision/compactRevision is
-  `>=` every follower's — a hard single-leader raft invariant. Under s3raft the epoch
+  `>=` every follower's — a hard single-leader raft invariant. Under libraft the epoch
   owner is routinely *behind* a peer that just wrote and applied locally, so the
   assertion fails and raises a false `CORRUPT` alarm (member, or whole-cluster, write
   outage). It is off by default (`corrupt-check-time-interval: 0s`); if
-  `--corrupt-check-time` > 0, s3raft fails fast with a clear error rather than boot into
+  `--corrupt-check-time` > 0, libraft fails fast with a clear error rather than boot into
   that time bomb. The cross-member KV *hash* comparison itself is fine (identical apply
   order ⇒ identical hash at identical revision); only the revision-ordering assertion
   breaks.
@@ -28,7 +28,7 @@ longer depends on operator discipline:
   keepalive delivered to a node during its pre-demotion window extends the lease only
   there while the true epoch owner may expire it. etcd already clamps every grant up to
   `MinLeaseTTL = ceil((3*ElectionTicks/2) · TickMs)` (≈2s at defaults, clearing the 1s
-  window with margin); s3raft **warns** at startup if that floor does not exceed the
+  window with margin); libraft **warns** at startup if that floor does not exceed the
   window (e.g. under an unusually short election timeout). Direct keepalives at the
   current epoch owner.
 
@@ -48,7 +48,7 @@ longer depends on operator discipline:
 Each cluster's objects live under a bucket namespace (`<bucket>/<prefix>/c-<hash>/…`)
 derived from three inputs — the **cluster token**, the **parent of the member's data
 directory**, and the **lowest `--initial-cluster` peer URL** (`nsFromConfig`,
-checkpoint.go) — cached on first boot in `<member>/s3raft-ns`. All three are identical
+checkpoint.go) — cached on first boot in `<member>/libraft-ns`. All three are identical
 across members (incl. those added later), stable across membership changes, and only
 read — never mutated — so they don't perturb etcd's cluster ID. The etcd cluster ID
 itself would be the ideal key but is unreachable without editing `bootstrap.go`
@@ -80,7 +80,7 @@ itself would be the ideal key but is unreachable without editing `bootstrap.go`
 
 - **A member add adds ~`pollInterval`+0.5s of latency** (`memberChangePropagationDelay`,
   node.go). The add is committed the instant its log object is CAS-written, but peers
-  learn of it only by *pulling* the log (s3raft sends no raft traffic), so the serving
+  learn of it only by *pulling* the log (libraft sends no raft traffic), so the serving
   node holds the ConfChange for one poll interval before `MemberAdd` returns — giving
   every peer time to apply it first. Without this a member started immediately after the
   add can query a peer that has not caught up and fail bootstrap validation ("member
@@ -98,7 +98,7 @@ itself would be the ideal key but is unreachable without editing `bootstrap.go`
 
 - **`--force-new-cluster` wipes this cluster's shared log and re-genesises from the
   local backend.** etcd's force-new rewrites the *local* WAL to a single-member
-  config; under s3raft the authority is the shared log, so the equivalent recovery is
+  config; under libraft the authority is the shared log, so the equivalent recovery is
   destructive: `forceNewClusterPurge` (checkpoint.go) synchronously deletes every
   object under this cluster's namespace (scoped strictly to the namespace prefix —
   never the whole bucket, so clusters sharing a bucket are untouched), then start()
@@ -106,9 +106,9 @@ itself would be the ideal key but is unreachable without editing `bootstrap.go`
   genesis history and this node claims the epoch. If etcd had taken a raft snapshot,
   the republish starts at the snapshot boundary and also publishes a bucket snapshot at
   the current index so a future member can restore the compacted-away prefix. Use it
-  **only when quorum is permanently lost** — s3raft cannot verify the other members are
+  **only when quorum is permanently lost** — libraft cannot verify the other members are
   dead, and any surviving member still pointed at this namespace will break (split
-  brain). A one-shot marker (`s3raft-force-new-done` in the member dir) stops a flag
+  brain). A one-shot marker (`libraft-force-new-done` in the member dir) stops a flag
   left in a boot unit from re-wiping the log on every restart; because etcd's force-new
   surgery still appends a fresh conf-change on each such restart, start() then heals the
   one-entry-ahead local WAL by publishing its tail rather than failing. To force a fresh
@@ -124,7 +124,7 @@ itself would be the ideal key but is unreachable without editing `bootstrap.go`
 - **The `raft.status` expvar is absent.** etcd's own `newRaftNode` also stores the node
   in the package-level `etcdserver.raftStatus` indirection that backs the `/debug/vars`
   `raft.status` entry. That symbol is unexported and unreachable from the `v3.NewRaftNode`
-  reconstruction, so the expvar is missing under s3raft. Debug-only; no functional impact.
+  reconstruction, so the expvar is missing under libraft. Debug-only; no functional impact.
 
 ## Configuration (security & notifier)
 

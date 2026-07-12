@@ -19,21 +19,21 @@ import "github.com/prometheus/client_golang/prometheus"
 var (
 	casConflicts = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: "etcd",
-		Subsystem: "s3raft",
+		Subsystem: "libraft",
 		Name:      "cas_conflicts_total",
 		Help:      "Total lost compare-and-swap races on shared log appends.",
 	})
 
 	s3Retries = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: "etcd",
-		Subsystem: "s3raft",
+		Subsystem: "libraft",
 		Name:      "s3_retries_total",
 		Help:      "Total S3 request retries due to transient faults (network/throttle/5xx).",
 	})
 
 	s3RequestSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: "etcd",
-		Subsystem: "s3raft",
+		Subsystem: "libraft",
 		Name:      "s3_request_seconds",
 		Help:      "Latency of individual S3 requests (one round trip).",
 		Buckets:   prometheus.ExponentialBuckets(0.001, 2, 14), // 1ms .. ~8s
@@ -41,7 +41,7 @@ var (
 
 	appendSeconds = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Namespace: "etcd",
-		Subsystem: "s3raft",
+		Subsystem: "libraft",
 		Name:      "append_seconds",
 		Help:      "End-to-end latency of a batched log append, including CAS retries.",
 		Buckets:   prometheus.ExponentialBuckets(0.001, 2, 14),
@@ -49,7 +49,7 @@ var (
 
 	appendBatchEntries = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Namespace: "etcd",
-		Subsystem: "s3raft",
+		Subsystem: "libraft",
 		Name:      "append_batch_entries",
 		Help:      "Number of proposals coalesced into one log-object append.",
 		Buckets:   []float64{1, 2, 4, 8, 16, 32, 64, 128, 256},
@@ -57,21 +57,21 @@ var (
 
 	readsDenied = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: "etcd",
-		Subsystem: "s3raft",
+		Subsystem: "libraft",
 		Name:      "reads_denied_total",
 		Help:      "Linearizable reads failed closed (store unreachable or node superseded).",
 	})
 
 	fenceDemotions = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: "etcd",
-		Subsystem: "s3raft",
+		Subsystem: "libraft",
 		Name:      "fence_demotions_total",
 		Help:      "Times this node demoted itself after observing a higher fencing epoch.",
 	})
 
 	checkpointIndex = prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: "etcd",
-		Subsystem: "s3raft",
+		Subsystem: "libraft",
 		Name:      "checkpoint_index",
 		Help:      "Raft index of the most recent bucket snapshot this node uploaded.",
 	})

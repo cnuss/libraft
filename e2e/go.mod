@@ -1,6 +1,6 @@
 // The e2e module is deliberately separate from the root libraft module: it
 // carries deps only the harness needs (the docker SDK for the MinIO
-// container, etcd's server/etcdmain tree for the etcd-s3raft binary) so they
+// container, etcd's server/etcdmain tree for the etcd-libraft binary) so they
 // never appear in the library's dependency graph.
 module github.com/cnuss/libraft/e2e
 

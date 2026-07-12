@@ -7,7 +7,7 @@
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cnuss/libraft/badge)](https://scorecard.dev/viewer/?uri=github.com/cnuss/libraft)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
-`libraft` (**s3raft**) replaces etcd's raft consensus with an
+`libraft` (**libraft**) replaces etcd's raft consensus with an
 **S3-compatible object store**. S3 conditional writes (`If-None-Match` / CAS)
 build a shared, totally-ordered append log — and that log *is* the raft log.
 Every node runs its own etcd apply loop over the same log, so anything computed
@@ -69,8 +69,8 @@ Three packages:
 
 ```
 github.com/cnuss/libraft             — the import seam: blank-import this to
-                                     install s3raft (re-exports EnvURL).
-github.com/cnuss/libraft/v3          — s3raft core: S3 CAS log, raft.Node over
+                                     install libraft (re-exports EnvURL).
+github.com/cnuss/libraft/v3          — libraft core: S3 CAS log, raft.Node over
                                      the log, bbolt checkpoint/restore, notify,
                                      batch, metrics.
 github.com/cnuss/libraft/v3/reflect  — the installer: monkey-patches etcd's
@@ -110,7 +110,7 @@ package that the linker places pages away from `etcdserver`; verify with
 
 ## When to use it
 
-s3raft trades write latency for operational simplicity: every write is an S3
+libraft trades write latency for operational simplicity: every write is an S3
 round-trip, so the latency floor is object-store RTT — physics, not tuning.
 That makes it a fit for **low-write control planes** (configuration, service
 discovery, CI locks) that want etcd's API without managing raft quorum, disks,
@@ -145,7 +145,7 @@ make e2e    # builds and runs every example binary, asserts its output
 module so its deps (docker SDK, `etcdmain`) stay out of the library's graph.
 The `-count=1` defeats the test cache, since the harness builds the example
 binaries at runtime and the cache key wouldn't otherwise pick up example
-source changes. The s3raft legs need a real S3-compatible store: with
+source changes. The libraft legs need a real S3-compatible store: with
 `AWS_REGION` set the ambient AWS env is used (`ETCD_S3LOG_URL` must point at
 the store); without it the harness starts a throwaway MinIO container via
 docker, and skips those legs where no linux-container daemon is reachable.

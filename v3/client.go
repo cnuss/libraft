@@ -45,8 +45,8 @@ import (
 var (
 	// errConflict is returned by putIfAbsent when the object already exists
 	// (the CAS lost the race).
-	errConflict = errors.New("s3raft: conditional write conflict")
-	errNotFound = errors.New("s3raft: object not found")
+	errConflict = errors.New("libraft: conditional write conflict")
+	errNotFound = errors.New("libraft: object not found")
 )
 
 type client struct {
@@ -89,7 +89,7 @@ type head struct {
 	Entry []byte `json:"entry,omitempty"` // batch body of the object keyed at Index
 }
 
-// epochKey is the fencing-epoch object: the s3raft analog of a raft term.
+// epochKey is the fencing-epoch object: the libraft analog of a raft term.
 const epochKey = "meta/epoch"
 
 // epochDoc is the JSON content of the epoch object. Owner is the member ID
@@ -107,14 +107,14 @@ type epochDoc struct {
 func newClient(rawurl string) (*client, error) {
 	u, err := url.Parse(rawurl)
 	if err != nil {
-		return nil, fmt.Errorf("s3raft: bad url %q: %w", rawurl, err)
+		return nil, fmt.Errorf("libraft: bad url %q: %w", rawurl, err)
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return nil, fmt.Errorf("s3raft: unsupported scheme %q (use http/https endpoint of an S3-compatible store)", u.Scheme)
+		return nil, fmt.Errorf("libraft: unsupported scheme %q (use http/https endpoint of an S3-compatible store)", u.Scheme)
 	}
 	parts := strings.SplitN(strings.Trim(u.Path, "/"), "/", 2)
 	if parts[0] == "" {
-		return nil, fmt.Errorf("s3raft: url %q missing bucket path", rawurl)
+		return nil, fmt.Errorf("libraft: url %q missing bucket path", rawurl)
 	}
 	cr := awsCredsFromEnv()
 	c := &client{
@@ -212,7 +212,7 @@ func (c *client) ensureBucket() error {
 	}
 	// 200 created, 409 BucketAlreadyOwnedByYou / BucketAlreadyExists
 	if status != http.StatusOK && status != http.StatusConflict {
-		return fmt.Errorf("s3raft: create bucket: unexpected status %d", status)
+		return fmt.Errorf("libraft: create bucket: unexpected status %d", status)
 	}
 
 	// Probe conditional-write support with a throwaway key.
@@ -233,7 +233,7 @@ func (c *client) ensureBucket() error {
 			return err
 		}
 	default:
-		return fmt.Errorf("s3raft: conditional write probe: unexpected status %d", status)
+		return fmt.Errorf("libraft: conditional write probe: unexpected status %d", status)
 	}
 
 	// Actively verify the guarantees the log's safety depends on, so a store
@@ -241,7 +241,7 @@ func (c *client) ensureBucket() error {
 	return c.verifyConsistency()
 }
 
-// verifyConsistency confirms, at startup, the two properties s3raft's
+// verifyConsistency confirms, at startup, the two properties libraft's
 // correctness rests on: strong read-after-write visibility and atomic
 // exact-precondition conditional writes. A store that fails either cannot
 // safely back a consensus log, so this returns a hard error rather than
@@ -254,16 +254,16 @@ func (c *client) verifyConsistency() error {
 
 	// 1. Read-after-write: a freshly written object must be immediately
 	//    visible with its exact bytes.
-	want := []byte("s3raft-probe")
+	want := []byte("libraft-probe")
 	if err := c.put(key, want); err != nil {
-		return fmt.Errorf("s3raft: consistency probe write: %w", err)
+		return fmt.Errorf("libraft: consistency probe write: %w", err)
 	}
 	got, etag, err := c.getWithETag(key)
 	if err != nil {
-		return fmt.Errorf("s3raft: consistency probe read-after-write: %w", err)
+		return fmt.Errorf("libraft: consistency probe read-after-write: %w", err)
 	}
 	if !bytes.Equal(got, want) {
-		return fmt.Errorf("s3raft: store violates read-after-write (wrote %q, read %q) — unsafe as a consensus log", want, got)
+		return fmt.Errorf("libraft: store violates read-after-write (wrote %q, read %q) — unsafe as a consensus log", want, got)
 	}
 
 	// 2. Conditional-write atomicity, tested in whichever mode is active. The
@@ -272,29 +272,29 @@ func (c *client) verifyConsistency() error {
 	//    log index and the total order is broken.
 	if c.etagChain {
 		if err := c.putIfMatch(key, []byte("cas-1"), etag); err != nil {
-			return fmt.Errorf("s3raft: If-Match CAS rejected a fresh etag: %w", err)
+			return fmt.Errorf("libraft: If-Match CAS rejected a fresh etag: %w", err)
 		}
 		switch err := c.putIfMatch(key, []byte("cas-2"), etag); err {
 		case errConflict:
 			// correct: the now-stale etag is refused
 		case nil:
-			return fmt.Errorf("s3raft: store does NOT enforce If-Match CAS (accepted a stale etag) — unsafe as a consensus log")
+			return fmt.Errorf("libraft: store does NOT enforce If-Match CAS (accepted a stale etag) — unsafe as a consensus log")
 		default:
-			return fmt.Errorf("s3raft: If-Match CAS probe: %w", err)
+			return fmt.Errorf("libraft: If-Match CAS probe: %w", err)
 		}
 	} else {
 		hdr := map[string]string{"If-None-Match": "*"}
 		status, _, _, err := c.do(http.MethodPut, c.prefix+key, nil, []byte("cas-x"), hdr)
 		if err != nil {
-			return fmt.Errorf("s3raft: If-None-Match probe: %w", err)
+			return fmt.Errorf("libraft: If-None-Match probe: %w", err)
 		}
 		switch status {
 		case http.StatusPreconditionFailed, http.StatusConflict:
 			// correct: create-if-absent refused an overwrite of the existing key
 		case http.StatusOK:
-			return fmt.Errorf("s3raft: store does NOT enforce If-None-Match:* (overwrote an existing key) — unsafe as a consensus log")
+			return fmt.Errorf("libraft: store does NOT enforce If-None-Match:* (overwrote an existing key) — unsafe as a consensus log")
 		default:
-			return fmt.Errorf("s3raft: If-None-Match probe: unexpected status %d", status)
+			return fmt.Errorf("libraft: If-None-Match probe: unexpected status %d", status)
 		}
 	}
 
@@ -359,7 +359,7 @@ func (c *client) appendCAS(firstIdx, lastIdx uint64, body []byte) error {
 			}
 			return errConflict
 		default:
-			return fmt.Errorf("s3raft: put %s: unexpected status %d", logKey(lastIdx), status)
+			return fmt.Errorf("libraft: put %s: unexpected status %d", logKey(lastIdx), status)
 		}
 	}
 
@@ -399,7 +399,7 @@ func (c *client) loadHead() (head, string, error) {
 		return h, "", err
 	}
 	if err := json.Unmarshal(raw, &h); err != nil {
-		return h, "", fmt.Errorf("s3raft: corrupt HEAD object: %w", err)
+		return h, "", fmt.Errorf("libraft: corrupt HEAD object: %w", err)
 	}
 	return h, etag, nil
 }
@@ -450,7 +450,7 @@ func (c *client) retryCAS(fn func() error) error {
 			backoff = conflictMaxBackoff
 		}
 	}
-	return fmt.Errorf("s3raft: too many CAS conflicts")
+	return fmt.Errorf("libraft: too many CAS conflicts")
 }
 
 // bumpEpoch atomically increments the fencing epoch and installs owner as
@@ -478,7 +478,7 @@ func (c *client) bumpEpoch(owner uint64) (uint64, error) {
 		}
 		var d epochDoc
 		if err := json.Unmarshal(raw, &d); err != nil {
-			return fmt.Errorf("s3raft: corrupt epoch object: %w", err)
+			return fmt.Errorf("libraft: corrupt epoch object: %w", err)
 		}
 		d.Epoch++
 		d.Owner = owner
@@ -503,7 +503,7 @@ func (c *client) currentEpoch() (epochDoc, error) {
 		return d, err
 	}
 	if err := json.Unmarshal(raw, &d); err != nil {
-		return d, fmt.Errorf("s3raft: corrupt epoch object: %w", err)
+		return d, fmt.Errorf("libraft: corrupt epoch object: %w", err)
 	}
 	return d, nil
 }
@@ -514,7 +514,7 @@ func (c *client) put(key string, body []byte) error {
 		return err
 	}
 	if status != http.StatusOK {
-		return fmt.Errorf("s3raft: put %s: unexpected status %d", key, status)
+		return fmt.Errorf("libraft: put %s: unexpected status %d", key, status)
 	}
 	return nil
 }
@@ -526,7 +526,7 @@ func (c *client) del(key string) error {
 		return err
 	}
 	if status != http.StatusOK && status != http.StatusNoContent && status != http.StatusNotFound {
-		return fmt.Errorf("s3raft: delete %s: unexpected status %d", key, status)
+		return fmt.Errorf("libraft: delete %s: unexpected status %d", key, status)
 	}
 	return nil
 }
@@ -577,7 +577,7 @@ func (c *client) putIfMatch(key string, body []byte, etag string) error {
 		}
 		return errConflict
 	default:
-		return fmt.Errorf("s3raft: conditional put %s: unexpected status %d", key, status)
+		return fmt.Errorf("libraft: conditional put %s: unexpected status %d", key, status)
 	}
 }
 
@@ -592,7 +592,7 @@ func (c *client) getWithETag(key string) ([]byte, string, error) {
 	case http.StatusNotFound:
 		return nil, "", errNotFound
 	default:
-		return nil, "", fmt.Errorf("s3raft: get %s: unexpected status %d", key, status)
+		return nil, "", fmt.Errorf("libraft: get %s: unexpected status %d", key, status)
 	}
 }
 
@@ -622,11 +622,11 @@ func (c *client) listAfter(keyPrefix, after string) ([]string, error) {
 			return nil, err
 		}
 		if status != http.StatusOK {
-			return nil, fmt.Errorf("s3raft: list: unexpected status %d", status)
+			return nil, fmt.Errorf("libraft: list: unexpected status %d", status)
 		}
 		var lr listResult
 		if err := xml.Unmarshal(body, &lr); err != nil {
-			return nil, fmt.Errorf("s3raft: list: bad xml: %w", err)
+			return nil, fmt.Errorf("libraft: list: bad xml: %w", err)
 		}
 		for _, k := range lr.Keys {
 			out = append(out, strings.TrimPrefix(k, c.prefix))
