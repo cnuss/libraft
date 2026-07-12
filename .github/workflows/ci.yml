@@ -272,6 +272,29 @@ jobs:
       #     grep -q 'dialTimeout: 60 \* time.Second' "$f" || { echo "dialTimeout patch did not apply"; exit 1; }
       #     echo "patched $f: dialTimeout 7s -> 60s (ctl wrapper 15s -> 121s)"
 
+      - name: raise etcd framework command-timeout for real-S3 latency (reflect-aws only)
+        if: matrix.mode == 'reflect-aws'
+        working-directory: etcd
+        # EtcdctlV3.spawnJSONCmd runs etcdctl with no --command-timeout, so
+        # etcdctl's built-in 5s governs each op. TestCtlV3AuthCertCNWithWithConcurrentOperation
+        # drives two goroutines hammering the shared log on a single node; under
+        # real-S3 CAS contention an op can spike past 5s, error, and t.Fatalf —
+        # which orphans the sibling's in-flight etcdctl child, whose expect.Close()
+        # (a bare wg.Wait, no kill) then blocks and leaks a goroutine that cascades
+        # t.Skip through every later auth test. Give flags() a default
+        # command-timeout so ops ride out contention spikes; per-op o.Timeout
+        # overrides still win (cmdArgs appends them after flags()). This is a
+        # genuine real-S3 write-latency accommodation, unrelated to the (now
+        # confirmation-based, no longer fixed-sleep) propagation barrier.
+        run: |
+          set -euo pipefail
+          g=tests/framework/e2e/etcdctl.go
+          grep -q 'fmap\["endpoints"\] = strings.Join(ctl.endpoints, ",")' "$g" \
+            || { echo "etcdctl flags() endpoints anchor not found in $g — etcd $ETCD_REF changed it; update this patch"; exit 1; }
+          perl -0777 -i -pe 's/(fmap\["endpoints"\] = strings\.Join\(ctl\.endpoints, ","\))/$1\n\tfmap["command-timeout"] = "60s"/' "$g"
+          grep -q 'fmap\["command-timeout"\] = "60s"' "$g" || { echo "etcdctl command-timeout patch did not apply"; exit 1; }
+          echo "patched $g: default etcdctl --command-timeout=60s"
+
       - name: setup go
         uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
