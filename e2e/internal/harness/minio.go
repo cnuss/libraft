@@ -10,6 +10,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sync"
+	"testing"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -39,6 +41,35 @@ type Store struct {
 	Skip    string
 	Err     error
 	Cleanup func()
+}
+
+var (
+	s3     Store
+	s3once sync.Once
+)
+
+// S3Env stands the store up on first use (via StartS3) and returns the env vars
+// that point an example at it. It skips the calling test when no store can
+// exist here and fails it when one should but is misconfigured. Pair it with
+// Cleanup in TestMain.
+func S3Env(t *testing.T) []string {
+	t.Helper()
+	s3once.Do(func() { s3 = StartS3() })
+	if s3.Err != nil {
+		t.Fatalf("s3 store setup: %v", s3.Err)
+	}
+	if s3.Skip != "" {
+		t.Skip(s3.Skip)
+	}
+	return s3.Env
+}
+
+// Cleanup tears down the store S3Env started, if any. Call it once after every
+// test that used the store has finished, typically from TestMain.
+func Cleanup() {
+	if s3.Cleanup != nil {
+		s3.Cleanup()
+	}
 }
 
 // StartS3 returns an S3 store for the e2e run. When AWS_REGION is set the
