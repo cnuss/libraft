@@ -257,12 +257,25 @@ jobs:
         # line ever moves upstream rather than silently leaving 15s in place.
         run: |
           set -euo pipefail
+          # (1) ctl-test wrapper timeout: getTestTimeout() = 2*dialTimeout + 1s.
           f=tests/e2e/ctl_v3_test.go
           grep -q 'dialTimeout: 7 \* time.Second' "$f" \
-            || { echo "timeout anchor not found in $f — etcd $ETCD_REF changed it; update this patch"; exit 1; }
+            || { echo "dialTimeout anchor not found in $f — etcd $ETCD_REF changed it; update this patch"; exit 1; }
           sed -i 's/dialTimeout: 7 \* time.Second/dialTimeout: 60 * time.Second/' "$f"
-          grep -q 'dialTimeout: 60 \* time.Second' "$f" || { echo "timeout patch did not apply"; exit 1; }
-          echo "patched $f: dialTimeout 7s -> 60s (ctl wrapper timeout 15s -> 121s)"
+          grep -q 'dialTimeout: 60 \* time.Second' "$f" || { echo "dialTimeout patch did not apply"; exit 1; }
+          echo "patched $f: dialTimeout 7s -> 60s (ctl wrapper 15s -> 121s)"
+          # (2) framework-internal probes derive from TickDuration, e.g.
+          # WaitMembersForLeader's per-Get budget = 10*TickDuration + 1s = 1.1s,
+          # which a post-restart linearizable read over real S3 blows (used by
+          # TestCtlV3LinearizableRead). TickDuration is test-timing only here (it
+          # is not wired into etcd's election/heartbeat flags), so bump it so the
+          # derived budget becomes 10*200ms + 1s = 3s.
+          g=tests/framework/config/cluster.go
+          grep -q 'TickDuration = 10 \* time.Millisecond' "$g" \
+            || { echo "TickDuration anchor not found in $g — etcd $ETCD_REF changed it; update this patch"; exit 1; }
+          sed -i 's/TickDuration = 10 \* time.Millisecond/TickDuration = 200 * time.Millisecond/' "$g"
+          grep -q 'TickDuration = 200 \* time.Millisecond' "$g" || { echo "TickDuration patch did not apply"; exit 1; }
+          echo "patched $g: TickDuration 10ms -> 200ms (WaitMembersForLeader get 1.1s -> 3s)"
 
       - name: setup go
         uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
