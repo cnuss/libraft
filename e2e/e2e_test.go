@@ -1,4 +1,4 @@
-package e2e
+package main
 
 import (
 	"os"
@@ -23,20 +23,26 @@ func newRunner(t *testing.T, name string) *runner {
 	if runtime.GOOS == "windows" {
 		bin += ".exe"
 	}
-	if out, err := exec.Command("go", "build", "-o", bin, "../examples/"+name).CombinedOutput(); err != nil {
+	// Build from inside the example directory: the examples live in the root
+	// module, not this one, so a relative package path from here would be
+	// rejected as outside the main module.
+	cmd := exec.Command("go", "build", "-o", bin, ".")
+	cmd.Dir = filepath.Join("..", "examples", name)
+	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build %s: %v\n%s", name, err, out)
 	}
 	return &runner{name: name, bin: bin}
 }
 
-// run executes the built example with args and returns (output, exitCode).
-// exitCode is -1 if the process could not be started.
-func (r *runner) run(t *testing.T, args ...string) (string, int) {
+// run executes the built example with extraEnv appended and returns
+// (output, exitCode). exitCode is -1 if the process could not be started.
+func (r *runner) run(t *testing.T, extraEnv []string, args ...string) (string, int) {
 	t.Helper()
 	cmd := exec.Command(r.bin, args...)
 	// Hermetic: strip ETCD_S3LOG_URL so an ambient value (e.g. exported by the
-	// etcd-e2e job) can't flip the example into s3raft mode — which this table
-	// does not assert on and which needs a live S3 store.
+	// etcd-e2e job) can't flip an example into s3raft mode behind a test's
+	// back. Tests that want s3raft mode pass the URL via extraEnv, which is
+	// appended after the filter and therefore wins.
 	env := os.Environ()
 	filtered := env[:0]
 	for _, kv := range env {
@@ -45,7 +51,7 @@ func (r *runner) run(t *testing.T, args ...string) (string, int) {
 		}
 		filtered = append(filtered, kv)
 	}
-	cmd.Env = filtered
+	cmd.Env = append(filtered, extraEnv...)
 	out, err := cmd.CombinedOutput()
 	code := 0
 	if err != nil {
@@ -65,7 +71,7 @@ func (r *runner) run(t *testing.T, args ...string) (string, int) {
 func assertExample(t *testing.T, name, want string) {
 	t.Helper()
 	r := newRunner(t, name)
-	out, code := r.run(t)
+	out, code := r.run(t, nil)
 	if code != 0 {
 		t.Errorf("%s exited %d, want 0", name, code)
 	}

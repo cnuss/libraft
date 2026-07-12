@@ -1,0 +1,3 @@
+# go build in this directory drops the etcd-s3raft binary here
+/e2e
+/e2e.exe
