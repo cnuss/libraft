@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"maps"
 	"math"
-	"os"
 	"slices"
 	"sort"
 	"strconv"
@@ -1178,15 +1177,12 @@ func (n *node) publishApplied(ctx context.Context) {
 // within ~ms, so an auth-heavy setup no longer pays a fixed second-plus per op.
 // Runs on the run goroutine (the proposer), like the sleep it replaces.
 func (n *node) awaitPropagation(target uint64) {
-	start := n.clk.Now() // DIAG
-	deadline := start.Add(propagationDelay)
+	deadline := n.clk.Now().Add(propagationDelay)
 	for {
 		if n.peersAppliedAtLeast(target) {
-			fmt.Fprintf(os.Stderr, "LIBRAFTDIAG barrier=confirmed target=%d waited=%s\n", target, n.clk.Since(start)) // DIAG
 			return
 		}
 		if !n.clk.Now().Before(deadline) {
-			fmt.Fprintf(os.Stderr, "LIBRAFTDIAG barrier=deadline target=%d waited=%s\n", target, n.clk.Since(start)) // DIAG
 			return
 		}
 		n.clk.Sleep(propagationCheckInterval)
@@ -1446,7 +1442,6 @@ func (n *node) deliver(r readResult) {
 func (n *node) startLinRead(rctx []byte) {
 	base := n.lastIndex
 	chain := n.cli.chainMode()
-	rdStart := n.clk.Now() // DIAG
 	go func() {
 		r := readResult{kind: readLin, rctx: rctx, chain: chain}
 		var wg sync.WaitGroup
@@ -1458,7 +1453,6 @@ func (n *node) startLinRead(rctx []byte) {
 			go func() { defer wg.Done(); r.h, r.hErr = n.cli.readHead() }()
 		}
 		wg.Wait()
-		fmt.Fprintf(os.Stderr, "LIBRAFTDIAG linread took=%s chain=%v epochErr=%v tailErr=%v\n", n.clk.Since(rdStart), chain, r.dErr != nil, r.tErr != nil) // DIAG
 		n.deliver(r)
 	}()
 }
