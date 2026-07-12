@@ -34,11 +34,14 @@ longer depends on operator discipline:
 
 ## Efficiency (correct, but wasteful) — not yet addressed
 
-- **A hung S3 call blocks the single-threaded run loop** for the S3 retry budget
-  (`s3RetryBudget`, ~12s; per-attempt deadline 5s) since confirmRead/checkTail/
-  checkEpoch do synchronous S3 I/O on the loop. Bounded and correct (reads fail
-  closed), but a fully-hung store still stalls the loop for that budget; a
-  caller-supplied context to cut the read path shorter is a further refinement.
+- **A hung S3 call on the propose path blocks the single-threaded run loop** for
+  the S3 retry budget (`s3RetryBudget`, ~12s; per-attempt deadline 5s):
+  `appendBatch` writes the log CAS synchronously on the loop. Reads no longer do
+  — the epoch check, linearizable read, and tail sync now run their S3 GETs in
+  goroutines and deliver results back for the loop to fold (only state mutation
+  stays on-loop), so a slow store no longer stalls proposals behind a read.
+  Moving the write CAS off the loop the same way, and a caller-supplied context
+  to cut the retry budget shorter, are further refinements.
 
 ## Membership & restore
 

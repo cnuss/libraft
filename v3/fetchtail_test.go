@@ -60,11 +60,12 @@ func TestFetchTailConcurrentOrder(t *testing.T) {
 	}
 }
 
-// TestConfirmReadFoldsParallelReads checks the parallelized confirmRead still
-// advances to the store's committed tail and reports it — the epoch read and
-// the tail fetch run concurrently, then fold on the calling goroutine. Run
-// under -race it also guards those concurrent reads.
-func TestConfirmReadFoldsParallelReads(t *testing.T) {
+// TestLinReadFoldsParallelReads checks the off-loop linearizable read still
+// advances to the store's committed tail and reports it: startLinRead does the
+// concurrent reads, applyReadResult folds them and emits a ReadState. Driving
+// them by hand (loop and producer are the same goroutine here) keeps the test
+// deterministic; run under -race it also guards the concurrent reads.
+func TestLinReadFoldsParallelReads(t *testing.T) {
 	ms := newMemStore()
 	if _, err := ms.bumpEpoch(1); err != nil { // epoch 1, owner 1
 		t.Fatalf("bumpEpoch: %v", err)
@@ -80,12 +81,21 @@ func TestConfirmReadFoldsParallelReads(t *testing.T) {
 		}
 	}
 
-	n := &node{id: 1, cli: ms, lg: zap.NewNop(), voters: map[uint64]struct{}{}, myEpoch: 1}
-	idx, ok := n.confirmRead()
-	if !ok {
-		t.Fatal("confirmRead denied, want ok")
+	n := &node{
+		id: 1, cli: ms, lg: zap.NewNop(),
+		voters:      map[uint64]struct{}{},
+		myEpoch:     1,
+		stopc:       make(chan struct{}),
+		readResultC: make(chan readResult, 1),
 	}
-	if idx != N || n.lastIndex != N {
-		t.Fatalf("idx=%d lastIndex=%d, want %d", idx, n.lastIndex, N)
+	n.startLinRead([]byte("req-1"))
+	r := <-n.readResultC // the off-loop reads have completed
+	n.applyReadResult(r) // fold on the "loop"
+
+	if n.lastIndex != N {
+		t.Fatalf("lastIndex=%d, want %d", n.lastIndex, N)
+	}
+	if len(n.pendingReads) != 1 || n.pendingReads[0].Index != N || string(n.pendingReads[0].RequestCtx) != "req-1" {
+		t.Fatalf("pendingReads=%+v, want one ReadState{Index:%d, Ctx:req-1}", n.pendingReads, N)
 	}
 }

@@ -142,12 +142,13 @@ func (m *memStore) listenBucketNotifications(ctx context.Context, keyPrefix stri
 }
 
 // TestEpochFencingWithMemStore exercises the fencing path — claimEpoch ->
-// checkEpoch -> checkFenced — against the in-memory store. Two nodes share one
+// startFenceRead -> applyEpoch -> checkFenced — against the in-memory store. Two nodes share one
 // store: the second to claim wins a higher epoch, and the first must demote to
 // follower and track the new owner on its next epoch check.
 func TestEpochFencingWithMemStore(t *testing.T) {
 	ms := newMemStore()
-	a := &node{id: 1, cli: ms, lg: zap.NewNop(), voters: map[uint64]struct{}{}}
+	a := &node{id: 1, cli: ms, lg: zap.NewNop(), voters: map[uint64]struct{}{},
+		stopc: make(chan struct{}), readResultC: make(chan readResult, 1)}
 	b := &node{id: 2, cli: ms, lg: zap.NewNop(), voters: map[uint64]struct{}{}}
 
 	if err := a.claimEpoch(); err != nil {
@@ -164,9 +165,10 @@ func TestEpochFencingWithMemStore(t *testing.T) {
 		t.Fatalf("B after claim: isLeader=%v myEpoch=%d, want true/2", b.isLeader, b.myEpoch)
 	}
 
-	// A re-confirms its epoch and must find it superseded → demote to follower,
-	// tracking B (owner of epoch 2) as leader.
-	a.checkEpoch()
+	// A re-confirms its epoch off the loop and must find it superseded → demote
+	// to follower, tracking B (owner of epoch 2) as leader.
+	a.startFenceRead()
+	a.applyReadResult(<-a.readResultC)
 	if a.isLeader {
 		t.Errorf("A still leader after B claimed a higher epoch; want demoted")
 	}
