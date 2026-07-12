@@ -16,6 +16,7 @@ package v3
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"math"
@@ -24,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -83,13 +85,22 @@ type node struct {
 	bgCtx        context.Context
 
 	// state below is owned by run()
-	lastIndex      uint64          // last log index known committed in S3
-	stableIndex    uint64          // last index already in the local MemoryStorage/WAL
-	pendingEntries []*raftpb.Entry // to hand out via Ready.Entries (WAL append)
-	pendingCommit  []*raftpb.Entry // to hand out via Ready.CommittedEntries
-	pendingReads   []raft.ReadState
-	pendingSoft    *raft.SoftState   // leadership announcement for the next Ready
-	pendingMsgs    []*raftpb.Message // heartbeats to hand out via Ready.Messages
+	lastIndex        uint64          // last log index known committed in S3
+	stableIndex      uint64          // last index already in the local MemoryStorage/WAL
+	pendingAppliedTo uint64          // commit index of the outstanding Ready; -> applied on Advance
+	pendingEntries   []*raftpb.Entry // to hand out via Ready.Entries (WAL append)
+	pendingCommit    []*raftpb.Entry // to hand out via Ready.CommittedEntries
+	pendingReads     []raft.ReadState
+	pendingSoft      *raft.SoftState   // leadership announcement for the next Ready
+	pendingMsgs      []*raftpb.Message // heartbeats to hand out via Ready.Messages
+
+	// applied is the highest log index etcd has finished applying on this node
+	// (advanced when run() observes Advance). Read off the run goroutine by the
+	// applied-marker publisher, so it is atomic. It is the value each node
+	// publishes to member/<id> and the quantity the propagation barrier waits on
+	// (see awaitPropagation): a peer's authStore/membership only reflects an
+	// entry once applied has passed it.
+	applied atomic.Uint64
 
 	// voters and maxTerm are written only on the run goroutine, but the
 	// checkpointer goroutine (runCheckpointer -> pruneProgress/uploadSnapshot)
@@ -333,6 +344,14 @@ func Start(lg *zap.Logger, rawurl string, id uint64, nsKey string, peers []raft.
 			zap.Uint64("restored-index", restoredIndex))
 	}
 
+	// Seed applied at the durable floor (the snapshot/restore index). The WAL
+	// tail base+1..li is persisted but not yet re-applied this process, so this
+	// is a deliberate under-report: applied climbs to the true value as run()
+	// re-emits those entries and observes Advance. Under-reporting only ever
+	// makes a peer's barrier wait longer (safe); over-reporting could release it
+	// before this node actually applied the entry.
+	n.applied.Store(base)
+
 	// --force-new-cluster re-genesis. forceNewClusterPurge (checkpoint.go) has
 	// already wiped this cluster's shared log; etcd's own force-new surgery left
 	// the local WAL holding the committed entries after its last raft snapshot
@@ -489,6 +508,7 @@ func Start(lg *zap.Logger, rawurl string, id uint64, nsKey string, peers []raft.
 	go n.poll()
 	go n.runCheckpointer()
 	go n.watchLog(notifyCtx)
+	go n.publishApplied(notifyCtx)
 	return n, nil
 }
 
@@ -895,7 +915,10 @@ func (n *node) run() {
 		case <-heartbeatTicker.C:
 			n.buildHeartbeats()
 		case out <- rd:
-			// hand out at most one Ready until the next Advance, like raft does
+			// hand out at most one Ready until the next Advance, like raft does.
+			// The committed entries in this Ready apply up to lastIndex; record
+			// that so Advance (etcd finished applying them) can publish it.
+			n.pendingAppliedTo = n.lastIndex
 			n.bootSnap = nil
 			n.pendingSoft = nil
 			n.pendingEntries = nil
@@ -905,6 +928,11 @@ func (n *node) run() {
 			awaitingAdvance = true
 		case <-n.advancec:
 			awaitingAdvance = false
+			// etcd has applied the entries from the Ready just handed out; expose
+			// the new applied index to the marker publisher (monotonic).
+			if n.pendingAppliedTo > n.applied.Load() {
+				n.applied.Store(n.pendingAppliedTo)
+			}
 		case <-n.stopc:
 			return
 		}
@@ -1064,9 +1092,12 @@ drain:
 		//     writes are the same shape.
 		//
 		// Holding here (before run() emits the committed entry, which is what
-		// unblocks the caller) gives every peer a full poll interval to catch
-		// up first.
-		n.clk.Sleep(propagationDelay)
+		// unblocks the caller) keeps every peer's view from lagging the caller.
+		// Rather than sleep a blind worst-case interval, wait for positive
+		// confirmation that peers actually applied this commit — fast when a
+		// notifier is live (peers apply and re-publish in ~ms), bounded by
+		// propagationDelay when one is down or unreachable.
+		n.awaitPropagation(n.lastIndex)
 	}
 	for _, p := range batch {
 		if p.resc != nil {
@@ -1075,11 +1106,113 @@ drain:
 	}
 }
 
-// propagationDelay bounds how long a member add or auth mutation is held on the
-// serving node before the proposing call returns, so peers pull the change
-// first. It exceeds pollInterval so a peer whose change-notification stream is
-// degraded still catches up via the poll fallback within the window.
+// propagationDelay is the *ceiling* the propagation barrier waits for peers to
+// confirm they applied a member add / auth mutation (see awaitPropagation).
+// Confirmation normally returns far sooner; this bounds the wait when a peer is
+// down or unreachable, and it exceeds pollInterval so a peer that fell back to
+// polling still catches up within the window before the barrier gives up.
 const propagationDelay = pollInterval + 500*time.Millisecond
+
+// propagationCheckInterval paces the barrier's re-checks of peer applied
+// markers. Small relative to the store round-trip that dominates each check, so
+// confirmation is observed promptly without busy-spinning.
+const propagationCheckInterval = 25 * time.Millisecond
+
+// appliedMarkerInterval is how often the publisher rewrites this node's
+// member/<id> applied marker while its applied index is advancing. It bounds how
+// stale a peer's published applied can be, hence the barrier's confirmation
+// latency floor; kept well under propagationDelay so the common path is fast.
+const appliedMarkerInterval = 100 * time.Millisecond
+
+// appliedMarker is the body of a member/<id> object: the highest log index that
+// node has applied, plus a wall-clock stamp for operators inspecting the bucket
+// (the barrier itself keys only off Applied).
+type appliedMarker struct {
+	Applied uint64 `json:"applied"`
+	UnixNs  int64  `json:"ts"`
+}
+
+// memberKey is the object key under which a node publishes its applied marker.
+func memberKey(id uint64) string { return "member/" + strconv.FormatUint(id, 16) }
+
+// publishApplied writes this node's applied index to member/<id> whenever it
+// advances, so peers' propagation barriers can confirm this node has caught up.
+// Runs off the run goroutine (reads applied atomically); writes only on change,
+// so an idle node makes no store traffic.
+func (n *node) publishApplied(ctx context.Context) {
+	t := time.NewTicker(appliedMarkerInterval)
+	defer t.Stop()
+	var last uint64
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			a := n.applied.Load()
+			if a == last {
+				continue
+			}
+			body, err := json.Marshal(appliedMarker{Applied: a, UnixNs: n.clk.Now().UnixNano()})
+			if err != nil {
+				continue
+			}
+			if n.cli.put(memberKey(n.id), body) == nil {
+				last = a
+			}
+		}
+	}
+}
+
+// awaitPropagation blocks until every other voter has published an applied index
+// >= target, or propagationDelay elapses. Returning on the deadline is the
+// same safety the old blind sleep gave (a down peer never confirms); returning
+// on confirmation is the win — with a live notifier peers apply and re-publish
+// within ~ms, so an auth-heavy setup no longer pays a fixed second-plus per op.
+// Runs on the run goroutine (the proposer), like the sleep it replaces.
+func (n *node) awaitPropagation(target uint64) {
+	deadline := n.clk.Now().Add(propagationDelay)
+	for {
+		if n.peersAppliedAtLeast(target) {
+			return
+		}
+		if !n.clk.Now().Before(deadline) {
+			return
+		}
+		n.clk.Sleep(propagationCheckInterval)
+	}
+}
+
+// peersAppliedAtLeast reports whether every voter other than this node has a
+// published applied marker at or beyond target. A missing/unreadable/behind
+// marker yields false (not yet confirmed) — the caller retries until the
+// deadline. Reads voters under membMu; issues one store GET per peer.
+func (n *node) peersAppliedAtLeast(target uint64) bool {
+	for _, id := range n.otherVoters() {
+		body, err := n.cli.get(memberKey(id))
+		if err != nil {
+			return false
+		}
+		var m appliedMarker
+		if json.Unmarshal(body, &m) != nil || m.Applied < target {
+			return false
+		}
+	}
+	return true
+}
+
+// otherVoters returns the current voter IDs excluding this node, sorted.
+func (n *node) otherVoters() []uint64 {
+	n.membMu.RLock()
+	defer n.membMu.RUnlock()
+	ids := make([]uint64, 0, len(n.voters))
+	for id := range n.voters {
+		if id != n.id {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	return ids
+}
 
 // addsMember reports whether the batch contains a ConfChange that adds a member
 // (voter or learner) — the case that a freshly started member's bootstrap must

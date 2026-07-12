@@ -15,10 +15,13 @@
 package v3
 
 import (
+	"encoding/json"
 	"testing"
+	"time"
 
 	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/raft/v3/raftpb"
+	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -103,5 +106,94 @@ func TestMutatesAuth(t *testing.T) {
 	cc := []proposal{{typ: raftpb.EntryConfChange, data: confChange(t, raftpb.ConfChangeAddNode)}}
 	if mutatesAuth(cc) {
 		t.Error("mutatesAuth(ConfChange batch) = true, want false")
+	}
+}
+
+// writeMarker publishes an applied marker for id into the store, as
+// publishApplied would.
+func writeMarker(t *testing.T, ms *memStore, id, applied uint64) {
+	t.Helper()
+	b, err := json.Marshal(appliedMarker{Applied: applied, UnixNs: 1})
+	if err != nil {
+		t.Fatalf("marshal marker: %v", err)
+	}
+	if err := ms.put(memberKey(id), b); err != nil {
+		t.Fatalf("put marker: %v", err)
+	}
+}
+
+func newBarrierNode(id uint64, ms *memStore, clk clock, voters ...uint64) *node {
+	vs := map[uint64]struct{}{}
+	for _, v := range voters {
+		vs[v] = struct{}{}
+	}
+	return &node{id: id, cli: ms, lg: zap.NewNop(), voters: vs, clk: clk}
+}
+
+func TestPeersAppliedAtLeast(t *testing.T) {
+	ms := newMemStore()
+	n := newBarrierNode(1, ms, &fakeClock{}, 1, 2, 3)
+
+	if n.peersAppliedAtLeast(10) {
+		t.Fatal("no markers present: want not-confirmed")
+	}
+	writeMarker(t, ms, 2, 10)
+	if n.peersAppliedAtLeast(10) {
+		t.Fatal("only peer 2 present: want not-confirmed (peer 3 missing)")
+	}
+	writeMarker(t, ms, 3, 9)
+	if n.peersAppliedAtLeast(10) {
+		t.Fatal("peer 3 behind (9<10): want not-confirmed")
+	}
+	writeMarker(t, ms, 3, 10)
+	if !n.peersAppliedAtLeast(10) {
+		t.Fatal("both peers at target: want confirmed")
+	}
+	// A higher published index still confirms a lower target.
+	if !n.peersAppliedAtLeast(5) {
+		t.Fatal("both peers past target: want confirmed")
+	}
+}
+
+func TestPeersAppliedAtLeastSingleMember(t *testing.T) {
+	// Only self is a voter: no peer to wait on, so any target is trivially met.
+	n := newBarrierNode(1, newMemStore(), &fakeClock{}, 1)
+	if !n.peersAppliedAtLeast(42) {
+		t.Fatal("single-member cluster: want confirmed with no peers")
+	}
+}
+
+func TestAwaitPropagationConfirmsWithoutWaiting(t *testing.T) {
+	ms := newMemStore()
+	fc := &fakeClock{now: time.Unix(0, 0)}
+	n := newBarrierNode(1, ms, fc, 1, 2)
+	writeMarker(t, ms, 2, 100)
+
+	n.awaitPropagation(100) // peer already caught up
+	if len(fc.slept) != 0 {
+		t.Fatalf("confirmed immediately: want 0 sleeps, got %v", fc.slept)
+	}
+}
+
+func TestAwaitPropagationFallsBackToDeadline(t *testing.T) {
+	ms := newMemStore()
+	fc := &fakeClock{now: time.Unix(0, 0)}
+	n := newBarrierNode(1, ms, fc, 1, 2)
+	// Peer 2 never reaches the target (simulates a down/lagging member); the
+	// barrier must give up at the deadline rather than block forever.
+	writeMarker(t, ms, 2, 5)
+
+	n.awaitPropagation(100)
+
+	var total time.Duration
+	for _, d := range fc.slept {
+		total += d
+	}
+	if total < propagationDelay {
+		t.Fatalf("fallback should wait ~propagationDelay before giving up, waited %v", total)
+	}
+	// And it must stop near the deadline, not spin far past it.
+	if total > propagationDelay+propagationCheckInterval {
+		t.Fatalf("overran the deadline: waited %v (ceiling %v)", total, propagationDelay)
 	}
 }
