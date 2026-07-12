@@ -311,6 +311,20 @@ jobs:
           echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
           echo "ETCD_S3LOG_URL=$url" >> "$GITHUB_ENV"
           echo "store: $url"
+          # etcd's e2e framework forwards ONLY ETCD_/ETCDCTL_/EXPECT_/PATH env
+          # to the spawned server (tests/framework/e2e/util.go
+          # mergeEnvVariables), so AWS_* from the assume-role step never reach
+          # the hijacked binary — it would fall back to the minioadmin default
+          # and get InvalidAccessKeyId. Re-export the temporary creds under
+          # ETCD_S3LOG_* names, which the client reads first (client.go) and the
+          # framework does forward. (saml.to's STS tokens carry no '=', so that
+          # helper's naive '='-split doesn't truncate them.)
+          {
+            echo "ETCD_S3LOG_ACCESS_KEY=${AWS_ACCESS_KEY_ID}"
+            echo "ETCD_S3LOG_SECRET_KEY=${AWS_SECRET_ACCESS_KEY}"
+            echo "ETCD_S3LOG_SESSION_TOKEN=${AWS_SESSION_TOKEN}"
+            echo "ETCD_S3LOG_REGION=${AWS_DEFAULT_REGION}"
+          } >> "$GITHUB_ENV"
 
       # Isolate hijack startup from the e2e framework: run the hijacked binary
       # standalone with minimal single-node args and capture its FULL output.
