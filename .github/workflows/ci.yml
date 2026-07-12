@@ -264,26 +264,6 @@ jobs:
           sed -i 's/dialTimeout: 7 \* time.Second/dialTimeout: 60 * time.Second/' "$f"
           grep -q 'dialTimeout: 60 \* time.Second' "$f" || { echo "dialTimeout patch did not apply"; exit 1; }
           echo "patched $f: dialTimeout 7s -> 60s (ctl wrapper 15s -> 121s)"
-          # (2) WaitMembersForLeader (tests/framework/e2e/cluster.go) busy-loops a
-          # linearizable `get 0`, breaking only on success/"Key not found", inside
-          # a 30s WaitLeader budget. Each get is bounded by 10*TickDuration + 1s =
-          # 1.1s. A restart test (TestCtlV3LinearizableRead) makes the node replay
-          # its S3 log and re-establish the epoch before it can serve that read,
-          # which over real S3 exceeds 1.1s every attempt until the 30s fatal.
-          # Raise the two binding values surgically (not the shared TickDuration,
-          # whose sleeps feed other loops): per-get budget 1.1s -> 30s, and the
-          # WaitLeader ctx 30s -> 180s. If the read is merely slow this passes; if
-          # it never lands the job still fails, exposing a real recovery stall.
-          g=tests/framework/e2e/cluster.go
-          grep -q 'Timeout: 10\*config.TickDuration + time.Second' "$g" \
-            || { echo "WaitMembersForLeader get-timeout anchor not found in $g — etcd $ETCD_REF changed it"; exit 1; }
-          sed -i 's/Timeout: 10\*config.TickDuration + time.Second/Timeout: 30 * time.Second/' "$g"
-          grep -q 'context.WithTimeout(tb.Context(), 30\*time.Second)' "$g" \
-            || { echo "WaitLeader ctx anchor not found in $g — etcd $ETCD_REF changed it"; exit 1; }
-          sed -i 's/context.WithTimeout(tb.Context(), 30\*time.Second)/context.WithTimeout(tb.Context(), 180*time.Second)/' "$g"
-          grep -q 'Timeout: 30 \* time.Second' "$g" && grep -q 'tb.Context(), 180\*time.Second' "$g" \
-            || { echo "WaitMembersForLeader patches did not apply"; exit 1; }
-          echo "patched $g: WaitMembersForLeader get 1.1s -> 30s, WaitLeader ctx 30s -> 180s"
 
       - name: setup go
         uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
@@ -366,13 +346,6 @@ jobs:
             echo "ETCD_S3LOG_SESSION_TOKEN=${AWS_SESSION_TOKEN}"
             echo "ETCD_S3LOG_REGION=${AWS_DEFAULT_REGION}"
           } >> "$GITHUB_ENV"
-          # Per-operation budget for the etcdctl commands the tests spawn (e.g.
-          # `endpoint health`, a linearizable read = several S3 GETs). The tests
-          # don't pass --command-timeout, so this ETCDCTL_ env is honored and the
-          # e2e framework forwards it (ETCDCTL_ prefix). Raised from the 5s
-          # default so a single slow real-S3 read doesn't report a healthy
-          # endpoint as unhealthy.
-          echo "ETCDCTL_COMMAND_TIMEOUT=30s" >> "$GITHUB_ENV"
 
       # Isolate hijack startup from the e2e framework: run the hijacked binary
       # standalone with minimal single-node args and capture its FULL output.
