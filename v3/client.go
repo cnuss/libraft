@@ -202,22 +202,68 @@ func sigV4Authorization(accessKey, secretKey, region, service, amzDate, dateStam
 		accessKey, scope, signedHeaders, signature)
 }
 
+// s3ErrDetail renders the S3 error body (XML <Code>/<Message>) plus the
+// x-amz-bucket-region header when present, for appending to an unexpected-status
+// error. Returns "" when there's nothing useful, so callers can concatenate it
+// unconditionally. A 403 with <Code>SignatureDoesNotMatch</Code> means a signing
+// bug; PermanentRedirect/AuthorizationHeaderMalformed with a region header means
+// wrong endpoint/region.
+func s3ErrDetail(body []byte, hdr http.Header) string {
+	var parts []string
+	if code := xmlTagValue(body, "Code"); code != "" {
+		if msg := xmlTagValue(body, "Message"); msg != "" {
+			parts = append(parts, code+": "+msg)
+		} else {
+			parts = append(parts, code)
+		}
+	} else if b := strings.TrimSpace(string(body)); b != "" {
+		if len(b) > 300 {
+			b = b[:300] + "…"
+		}
+		parts = append(parts, b)
+	}
+	if r := hdr.Get("x-amz-bucket-region"); r != "" {
+		parts = append(parts, "x-amz-bucket-region="+r)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(parts, "; ") + ")"
+}
+
+// xmlTagValue pulls the text of the first <tag>…</tag> from an S3 error body
+// without a full XML parse (the bodies are tiny and flat).
+func xmlTagValue(body []byte, tag string) string {
+	open, close := "<"+tag+">", "</"+tag+">"
+	s := string(body)
+	i := strings.Index(s, open)
+	if i < 0 {
+		return ""
+	}
+	i += len(open)
+	j := strings.Index(s[i:], close)
+	if j < 0 {
+		return ""
+	}
+	return strings.TrimSpace(s[i : i+j])
+}
+
 // ensureBucket creates the bucket (tolerating "already exists") and probes
 // whether the store supports `If-None-Match: *` create-if-absent. If not,
 // it switches to ETag-chain mode and initializes the HEAD pointer.
 func (c *client) ensureBucket() error {
-	status, _, _, err := c.do(http.MethodPut, "", nil, nil, nil)
+	status, body, hdr, err := c.do(http.MethodPut, "", nil, nil, nil)
 	if err != nil {
 		return err
 	}
 	// 200 created, 409 BucketAlreadyOwnedByYou / BucketAlreadyExists
 	if status != http.StatusOK && status != http.StatusConflict {
-		return fmt.Errorf("libraft: create bucket: unexpected status %d", status)
+		return fmt.Errorf("libraft: create bucket: unexpected status %d%s", status, s3ErrDetail(body, hdr))
 	}
 
 	// Probe conditional-write support with a throwaway key.
 	probe := c.prefix + "meta/cas-probe"
-	status, _, _, err = c.do(http.MethodPut, probe, nil, []byte("probe"), map[string]string{"If-None-Match": "*"})
+	status, body, hdr, err = c.do(http.MethodPut, probe, nil, []byte("probe"), map[string]string{"If-None-Match": "*"})
 	if err != nil {
 		return err
 	}
@@ -233,7 +279,7 @@ func (c *client) ensureBucket() error {
 			return err
 		}
 	default:
-		return fmt.Errorf("libraft: conditional write probe: unexpected status %d", status)
+		return fmt.Errorf("libraft: conditional write probe: unexpected status %d%s", status, s3ErrDetail(body, hdr))
 	}
 
 	// Actively verify the guarantees the log's safety depends on, so a store
