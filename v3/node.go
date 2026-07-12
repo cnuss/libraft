@@ -114,7 +114,7 @@ type node struct {
 	maxTerm  uint64
 	isLeader bool
 	// lead is the member id this node currently announces as leader (the epoch
-	// owner) while demoted. Kept current by checkEpoch so a follower tracks the
+	// owner) while demoted. Kept current by applyEpoch so a follower tracks the
 	// owner as it advances across successive joins, instead of freezing on the
 	// first owner it fenced to.
 	lead uint64
@@ -130,6 +130,15 @@ type node struct {
 	// notification storm cannot starve the run loop.
 	lastSync    time.Time
 	resyncArmed bool
+
+	// Off-loop read plumbing (owned by run()). The epoch check, linearizable
+	// read, and tail sync do their S3 reads in goroutines and deliver the
+	// results here; the run loop applies them (all state mutation stays on the
+	// loop) so a round-trip never stalls proposals. fenceInFlight/tailInFlight
+	// coalesce the periodic reads so ticks don't pile up while one is running.
+	readResultC   chan readResult
+	fenceInFlight bool
+	tailInFlight  bool
 
 	// bootSnap, when set, is emitted as the first Ready.Snapshot to
 	// fast-forward etcd through a bucket-restored snapshot on a disk-wiped
@@ -156,7 +165,7 @@ const pollInterval = time.Second
 const minSyncInterval = 50 * time.Millisecond
 
 // fenceCheckInterval is how often a node acting as leader re-confirms its
-// fencing epoch is still current (see checkEpoch). It bounds the worst-case
+// fencing epoch is still current (see startFenceRead/applyEpoch). It bounds the worst-case
 // window during which a superseded node keeps acting as leader; lease TTLs must
 // comfortably exceed it (etcd's default min lease TTL of 5s does, with margin).
 const fenceCheckInterval = time.Second
@@ -275,22 +284,23 @@ func Start(lg *zap.Logger, rawurl string, id uint64, nsKey string, peers []raft.
 	}
 
 	n := &node{
-		lg:        lg.Named("s3raft"),
-		id:        id,
-		cli:       cli,
-		clk:       realClock{},
-		proposec:  make(chan proposal),
-		readc:     make(chan []byte),
-		confc:     make(chan confReq),
-		statusc:   make(chan chan raft.Status),
-		pokec:     make(chan struct{}, 1),
-		advancec:  make(chan struct{}),
-		readyc:    make(chan raft.Ready),
-		transferc: make(chan uint64),
-		stopc:     make(chan struct{}),
-		done:      make(chan struct{}),
-		voters:    make(map[uint64]struct{}),
-		ms:        ms,
+		lg:          lg.Named("s3raft"),
+		id:          id,
+		cli:         cli,
+		clk:         realClock{},
+		readResultC: make(chan readResult, 64),
+		proposec:    make(chan proposal),
+		readc:       make(chan []byte),
+		confc:       make(chan confReq),
+		statusc:     make(chan chan raft.Status),
+		pokec:       make(chan struct{}, 1),
+		advancec:    make(chan struct{}),
+		readyc:      make(chan raft.Ready),
+		transferc:   make(chan uint64),
+		stopc:       make(chan struct{}),
+		done:        make(chan struct{}),
+		voters:      make(map[uint64]struct{}),
+		ms:          ms,
 	}
 
 	// Local durable state: entries the WAL already holds. base is the
@@ -465,9 +475,10 @@ func Start(lg *zap.Logger, rawurl string, id uint64, nsKey string, peers []raft.
 	)
 
 	// One context drives all background S3 work. Cancelling it on Stop aborts
-	// any in-flight run-loop S3 call (checkEpoch/confirmRead/syncTail), so the
-	// loop returns to its select and services stopc promptly instead of
-	// blocking shutdown for the S3 retry budget.
+	// any in-flight S3 call — the off-loop reads (startFenceRead/startLinRead/
+	// startTailRead) and the on-loop propose CAS — so the loop returns to its
+	// select and services stopc promptly instead of blocking shutdown for the
+	// S3 retry budget.
 	notifyCtx, cancel := context.WithCancel(context.Background())
 	n.notifyCancel = cancel
 	n.bgCtx = notifyCtx
@@ -740,8 +751,9 @@ func (n *node) ingest(ents []*raftpb.Entry) {
 	n.checkFenced()
 }
 
-// checkEpoch proactively demotes this node the instant a newer node claims the
-// fencing epoch, without waiting to observe that node's first log entry. This
+// The fence check (startFenceRead + applyEpoch) proactively demotes this node
+// the instant a newer node claims the fencing epoch, without waiting to observe
+// that node's first log entry. This
 // closes two windows that observing-a-higher-term-entry alone leaves open:
 //   - the new leader bumps meta/epoch at boot before it writes its no-op, so
 //     its authority is visible in the epoch object earlier than in the log; and
@@ -751,12 +763,25 @@ func (n *node) ingest(ents []*raftpb.Entry) {
 //
 // The detection window is therefore bounded by fenceCheckInterval regardless of
 // the new leader's write timing — this is the window lease TTLs must exceed.
-func (n *node) checkEpoch() {
-	d, err := n.cli.currentEpoch()
-	if err != nil {
-		n.lg.Warn("s3raft: epoch freshness check failed", zap.Error(err))
+// startFenceRead reads the fencing epoch off the loop and delivers it for
+// applyEpoch. Guarded by fenceInFlight so ticks don't pile up.
+func (n *node) startFenceRead() {
+	go func() {
+		var r readResult
+		r.kind = readFence
+		r.d, r.dErr = n.cli.currentEpoch()
+		n.deliver(r)
+	}()
+}
+
+// applyEpoch applies a fence-read result on the run loop (all state mutation
+// here). Mirrors the old synchronous checkEpoch after the read.
+func (n *node) applyEpoch(r readResult) {
+	if r.dErr != nil {
+		n.lg.Warn("s3raft: epoch freshness check failed", zap.Error(r.dErr))
 		return
 	}
+	d := r.d
 	n.bumpMaxTerm(d.Epoch)
 	if n.isLeader {
 		if d.Epoch > n.myEpoch {
@@ -838,18 +863,18 @@ func (n *node) run() {
 		case p := <-n.proposec:
 			n.handleProposals(p)
 		case rctx := <-n.readc:
-			// Linearizable read: establish an authoritative read index from the
-			// store's commit point, or fail closed. Dropping the ReadState on
-			// failure makes the read time out rather than return stale data.
-			if idx, ok := n.confirmRead(); ok {
-				n.pendingReads = append(n.pendingReads, raft.ReadState{Index: idx, RequestCtx: rctx})
-			}
+			// Linearizable read: do the S3 reads off the loop; the result is
+			// applied (and the ReadState emitted, or dropped to fail closed) when
+			// it arrives on readResultC, so the loop keeps serving proposals.
+			n.startLinRead(rctx)
 		case req := <-n.confc:
 			req.resc <- n.applyConf(req.cc)
 		case sc := <-n.statusc:
 			sc <- n.status()
 		case <-n.pokec:
 			n.syncTail()
+		case r := <-n.readResultC:
+			n.applyReadResult(r)
 		case t := <-n.transferc:
 			// Graceful-shutdown leadership transfer: announce the transferee as
 			// leader so etcdserver's MoveLeader wait loop (for s.Lead() ==
@@ -860,7 +885,12 @@ func (n *node) run() {
 			n.lead = t
 			n.pendingSoft = &raft.SoftState{Lead: t, RaftState: raft.StateFollower}
 		case <-fenceTicker.C:
-			n.checkEpoch()
+			// Confirm the fencing epoch off the loop; coalesce so a slow read
+			// doesn't let ticks pile up.
+			if !n.fenceInFlight {
+				n.fenceInFlight = true
+				n.startFenceRead()
+			}
 		case <-heartbeatTicker.C:
 			n.buildHeartbeats()
 		case out <- rd:
@@ -1117,11 +1147,12 @@ const (
 	casMaxAttempts = 64
 )
 
-// syncTail runs checkTail but no more often than minSyncInterval, so a burst
-// of notification wakeups (every cross-node write pokes us) collapses to one
-// S3 read per interval instead of saturating the single-threaded run loop with
-// blocking I/O and starving proposals. A poke arriving during the cooldown
-// re-arms a single deferred poke so no change is missed. Owned by run().
+// syncTail kicks off an off-loop tail read (startTailRead) but no more often
+// than minSyncInterval, so a burst of notification wakeups (every cross-node
+// write pokes us) collapses to one S3 read per interval instead of spawning a
+// read goroutine per poke. A poke arriving during the cooldown — or while a
+// read is still in flight (tailInFlight) — re-arms a single deferred poke so no
+// change is missed. Owned by run().
 func (n *node) syncTail() {
 	if d := n.clk.Since(n.lastSync); d < minSyncInterval {
 		if !n.resyncArmed {
@@ -1130,16 +1161,27 @@ func (n *node) syncTail() {
 		}
 		return
 	}
+	if n.tailInFlight {
+		// A tail read is already running; re-arm a single deferred poke so we
+		// re-check once it lands rather than dropping this wakeup.
+		if !n.resyncArmed {
+			n.resyncArmed = true
+			time.AfterFunc(minSyncInterval, n.poke)
+		}
+		return
+	}
 	n.resyncArmed = false
-	n.checkTail()
+	n.tailInFlight = true
+	n.startTailRead(n.lastIndex)
 	n.lastSync = n.clk.Now()
 }
 
-// confirmRead establishes an authoritative, linearizable read index by
-// consulting the object store directly, rather than trusting this node's
-// possibly-stale local view. It returns ok=false — and the caller then drops
-// the read so it fails closed — only when that authority cannot be positively
-// confirmed: an S3 error/partition leaves us unable to prove freshness.
+// The linearizable read path (startLinRead + applyLinRead) establishes an
+// authoritative read index by consulting the object store directly, rather than
+// trusting this node's possibly-stale local view. applyLinRead returns ok=false
+// — and the run loop then drops the read so it fails closed — only when that
+// authority cannot be positively confirmed: an S3 error/partition leaves us
+// unable to prove freshness.
 //
 // This is the s3raft analog of raft's ReadIndex, but simpler. Real raft must
 // route a linearizable read through the leader, because only the leader knows
@@ -1152,72 +1194,135 @@ func (n *node) syncTail() {
 // issue `member list` (a linearizable read) against any member, not just the
 // epoch owner. Each read costs a small number of S3 GETs — the price of
 // linearizability without a replicated quorum.
-func (n *node) confirmRead() (uint64, bool) {
-	// The reads a linearizable read needs are independent:
-	//   - currentEpoch (reachability + supersession gate)
-	//   - fetchTail    (the published committed tail)
-	//   - readHead     (etagChain mode only: the commit point that lives in HEAD
-	//                   before the per-index log object is published)
-	// None needs another's bytes, so fire them concurrently and fold the results
-	// on this goroutine — turning ~3 sequential round-trips into ~1. confirmRead
-	// runs on the run loop, which is parked at wg.Wait for the duration, so node
-	// state is stable and all mutation (bumpMaxTerm/checkFenced/ingest) still
-	// happens single-threaded on the loop after the reads complete.
+
+// readKind tags a readResult so the run loop knows which apply path to run.
+type readKind int
+
+const (
+	readFence readKind = iota // periodic epoch freshness check
+	readTail                  // tail sync (poll / notification)
+	readLin                   // linearizable read (readc)
+)
+
+// readResult carries the bytes of an off-loop read back to the run loop, which
+// applies them. All S3 reads happen in the producing goroutine; every field is
+// read-only once delivered, and only the loop mutates node state from it.
+type readResult struct {
+	kind readKind
+	rctx []byte // readLin: the read request's context, echoed in the ReadState
+
+	d    epochDoc // readFence, readLin
+	dErr error
+
+	tail []*raftpb.Entry // readTail, readLin
+	tErr error
+
+	chain bool // readLin: etagChain mode, so head was read too
+	h     head // readLin (chain)
+	hErr  error
+}
+
+// deliver hands a read result to the run loop, or drops it if the node is
+// stopping (so a producer goroutine never leaks blocked on a full channel).
+func (n *node) deliver(r readResult) {
+	select {
+	case n.readResultC <- r:
+	case <-n.stopc:
+	}
+}
+
+// startLinRead performs a linearizable read's three independent S3 reads
+// concurrently off the loop and delivers them for applyLinRead. base is
+// snapshotted on the loop so the producer never races n.lastIndex.
+func (n *node) startLinRead(rctx []byte) {
 	base := n.lastIndex
 	chain := n.cli.chainMode()
+	go func() {
+		r := readResult{kind: readLin, rctx: rctx, chain: chain}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); r.d, r.dErr = n.cli.currentEpoch() }()
+		go func() { defer wg.Done(); r.tail, r.tErr = n.fetchTail(base) }()
+		if chain {
+			wg.Add(1)
+			go func() { defer wg.Done(); r.h, r.hErr = n.cli.readHead() }()
+		}
+		wg.Wait()
+		n.deliver(r)
+	}()
+}
 
-	var (
-		d    epochDoc
-		dErr error
-		tail []*raftpb.Entry
-		tErr error
-		h    head
-		hErr error
-		wg   sync.WaitGroup
-	)
-	wg.Add(2)
-	go func() { defer wg.Done(); d, dErr = n.cli.currentEpoch() }()
-	go func() { defer wg.Done(); tail, tErr = n.fetchTail(base) }()
-	if chain {
-		wg.Add(1)
-		go func() { defer wg.Done(); h, hErr = n.cli.readHead() }()
+// startTailRead fetches the log tail past base off the loop and delivers it for
+// applyTail. Guarded by tailInFlight (set by the caller).
+func (n *node) startTailRead(base uint64) {
+	go func() {
+		r := readResult{kind: readTail}
+		r.tail, r.tErr = n.fetchTail(base)
+		n.deliver(r)
+	}()
+}
+
+// applyReadResult runs on the run loop and applies an off-loop read.
+func (n *node) applyReadResult(r readResult) {
+	switch r.kind {
+	case readFence:
+		n.fenceInFlight = false
+		n.applyEpoch(r)
+	case readTail:
+		n.tailInFlight = false
+		if r.tErr != nil {
+			n.lg.Warn("s3raft: tail check failed", zap.Error(r.tErr))
+			return
+		}
+		if len(r.tail) > 0 {
+			n.ingest(r.tail)
+		}
+	case readLin:
+		if idx, ok := n.applyLinRead(r); ok {
+			n.pendingReads = append(n.pendingReads, raft.ReadState{Index: idx, RequestCtx: r.rctx})
+		}
 	}
-	wg.Wait()
+}
 
+// applyLinRead folds a linearizable read's results into local state on the run
+// loop and returns the authoritative read index, or false to fail the read
+// closed (dropping the ReadState so it times out rather than returning stale
+// data). Semantics match the former synchronous confirmRead exactly.
+func (n *node) applyLinRead(r readResult) (uint64, bool) {
 	// Reachability + supersession gate. Supersession demotes us for lease
 	// purposes but does not deny the read — the commit point is in S3, not in a
 	// leader, so we can still answer linearizably below.
-	if dErr != nil {
+	if r.dErr != nil {
 		readsDenied.Inc()
-		n.lg.Warn("s3raft: linearizable read denied — epoch check failed", zap.Error(dErr))
+		n.lg.Warn("s3raft: linearizable read denied — epoch check failed", zap.Error(r.dErr))
 		return 0, false
 	}
-	if d.Epoch > n.myEpoch {
-		n.bumpMaxTerm(d.Epoch)
+	if r.d.Epoch > n.myEpoch {
+		n.bumpMaxTerm(r.d.Epoch)
 		n.checkFenced()
 	}
 
 	// Freshness gate: advance local state to the published committed tail.
-	if tErr != nil {
+	if r.tErr != nil {
 		readsDenied.Inc()
-		n.lg.Warn("s3raft: linearizable read denied — tail sync failed", zap.Error(tErr))
+		n.lg.Warn("s3raft: linearizable read denied — tail sync failed", zap.Error(r.tErr))
 		return 0, false
 	}
-	n.ingest(tail)
+	n.ingest(r.tail)
 
 	// etagChain mode: the commit point is the HEAD pointer, advanced by the
 	// If-Match CAS *before* the per-index log object is written (client.go). A
 	// reader that only lists log/ objects would miss a committed-but-not-yet-
 	// published (or crashed-mid-write) entry, so fold HEAD in after the tail and
 	// fail closed if we still cannot reach HEAD.Index.
-	if chain {
-		if hErr != nil {
+	if r.chain {
+		if r.hErr != nil {
 			readsDenied.Inc()
-			n.lg.Warn("s3raft: linearizable read denied — head read failed", zap.Error(hErr))
+			n.lg.Warn("s3raft: linearizable read denied — head read failed", zap.Error(r.hErr))
 			return 0, false
 		}
-		if h.Index > n.lastIndex && len(h.Entry) > 0 {
-			ents, derr := decodeEntries(h.Entry)
+		if r.h.Index > n.lastIndex && len(r.h.Entry) > 0 {
+			ents, derr := decodeEntries(r.h.Entry)
 			if derr != nil {
 				readsDenied.Inc()
 				n.lg.Warn("s3raft: linearizable read denied — corrupt head entry", zap.Error(derr))
@@ -1225,26 +1330,14 @@ func (n *node) confirmRead() (uint64, bool) {
 			}
 			n.ingest(ents)
 		}
-		if n.lastIndex < h.Index {
+		if n.lastIndex < r.h.Index {
 			readsDenied.Inc()
 			n.lg.Warn("s3raft: linearizable read denied — could not reach committed index",
-				zap.Uint64("head-index", h.Index), zap.Uint64("local-tail", n.lastIndex))
+				zap.Uint64("head-index", r.h.Index), zap.Uint64("local-tail", n.lastIndex))
 			return 0, false
 		}
 	}
 	return n.lastIndex, true
-}
-
-// checkTail ingests any entries other writers appended to the shared log.
-func (n *node) checkTail() {
-	tail, err := n.fetchTail(n.lastIndex)
-	if err != nil {
-		n.lg.Warn("s3raft: tail check failed", zap.Error(err))
-		return
-	}
-	if len(tail) > 0 {
-		n.ingest(tail)
-	}
 }
 
 func (n *node) poll() {
@@ -1302,7 +1395,7 @@ func (n *node) applyConf(cc raftpb.ConfChangeI) *raftpb.ConfState {
 func (n *node) status() raft.Status {
 	soft := raft.SoftState{Lead: n.id, RaftState: raft.StateLeader}
 	if !n.isLeader {
-		// n.lead is kept current by checkEpoch; report it directly rather than
+		// n.lead is kept current by applyEpoch; report it directly rather than
 		// paying a live S3 read on every status poll.
 		soft = raft.SoftState{Lead: n.lead, RaftState: raft.StateFollower}
 	}
