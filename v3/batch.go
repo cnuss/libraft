@@ -52,12 +52,12 @@ func decodeEntries(body []byte) ([]*raftpb.Entry, error) {
 	var out []*raftpb.Entry
 	for len(body) > 0 {
 		if len(body) < 4 {
-			return nil, fmt.Errorf("s3raft: truncated batch header")
+			return nil, fmt.Errorf("libraft: truncated batch header")
 		}
 		n := binary.BigEndian.Uint32(body[:4])
 		body = body[4:]
 		if uint32(len(body)) < n {
-			return nil, fmt.Errorf("s3raft: truncated batch entry (want %d, have %d)", n, len(body))
+			return nil, fmt.Errorf("libraft: truncated batch entry (want %d, have %d)", n, len(body))
 		}
 		e := &raftpb.Entry{}
 		if err := proto.Unmarshal(body[:n], e); err != nil {

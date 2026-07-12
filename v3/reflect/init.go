@@ -1,4 +1,4 @@
-// This file installs s3raft as a drop-in replacement for the raft
+// This file installs libraft as a drop-in replacement for the raft
 // algorithm WITHOUT modifying any etcd source: the only change to the tree
 // is a blank import of this package. When ETCD_S3LOG_URL is set, init()
 // rewrites the machine-code prologue of two functions with an unconditional
@@ -47,10 +47,10 @@ func init() {
 	if rawurl == "" {
 		return
 	}
-	lg := v3.Logger()
+	lg := v3.Logger().Named("libraft")
 	defer func() {
 		if r := recover(); r != nil {
-			lg.Fatal("s3raft: failed to install raft hijack",
+			lg.Fatal("libraft: failed to install raft hijack",
 				zap.Any("panic", r),
 				zap.String("arch", runtime.GOARCH))
 		}
@@ -65,7 +65,7 @@ func init() {
 	// raft.Node from the S3 log via v3.Start.
 	patchFunc(reflect.ValueOf(etcdNewRaftNode).Pointer(), reflect.ValueOf(v3.NewRaftNode).Pointer())
 
-	lg.Info("s3raft: hijacked (*bootstrappedRaft).newRaftNode and OpenBackend",
+	lg.Info("libraft: hijacked (*bootstrappedRaft).newRaftNode and OpenBackend",
 		zap.String("url", rawurl),
 		zap.String("arch", runtime.GOARCH))
 }
@@ -106,7 +106,7 @@ func jumpTo(addr uintptr) []byte {
 		putUint64(b[8:16], uint64(addr))
 		return b
 	default:
-		panic("s3raft: unsupported GOARCH " + runtime.GOARCH)
+		panic("libraft: unsupported GOARCH " + runtime.GOARCH)
 	}
 }
 
@@ -130,12 +130,12 @@ func writeText(addr uintptr, code []byte) {
 	span := ((end - start) + pageSize - 1) &^ (pageSize - 1)
 
 	if err := setWritable(start, span); err != nil {
-		panic(fmt.Sprintf("s3raft: make text writable failed: %v", err))
+		panic(fmt.Sprintf("libraft: make text writable failed: %v", err))
 	}
 	dst := unsafe.Slice((*byte)(unsafe.Pointer(addr)), len(code))
 	copy(dst, code)
 	flushICache(addr, len(code))
 	if err := setExecutable(start, span); err != nil {
-		panic(fmt.Sprintf("s3raft: restore text executable failed: %v", err))
+		panic(fmt.Sprintf("libraft: restore text executable failed: %v", err))
 	}
 }

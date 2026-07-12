@@ -111,8 +111,8 @@ func (m *minioNotifier) Watch(ctx context.Context, wake func()) error {
 // arrive as an HTTP POST. Wire its ServeHTTP onto the "POST /s3" route and
 // install it with SetNotifier before the node starts:
 //
-//	pn := &s3raft.PushNotifier{}
-//	s3raft.SetNotifier(pn)
+//	pn := &libraft.PushNotifier{}
+//	libraft.SetNotifier(pn)
 //	http.Handle("POST /s3", pn)
 //
 // Watch parks until ctx is done, holding the node's wake callback; each
@@ -216,7 +216,7 @@ func (c *client) listenBucketNotifications(ctx context.Context, keyPrefix string
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("s3raft: listen notifications: unexpected status %d", resp.StatusCode)
+		return fmt.Errorf("libraft: listen notifications: unexpected status %d", resp.StatusCode)
 	}
 
 	scanner := bufio.NewScanner(resp.Body)

@@ -1,4 +1,4 @@
-// NewRaftNode is the s3raft replacement for etcd's unexported
+// NewRaftNode is the libraft replacement for etcd's unexported
 // (*bootstrappedRaft).newRaftNode — the sole raft-construction site. The
 // installer (v3/reflect) monkey-patches newRaftNode to jump here; this file
 // holds the reconstruction because it is core logic (building the raft.Node
@@ -99,23 +99,23 @@ func NewRaftNode(bp, ssp, walp, clp unsafe.Pointer) unsafe.Pointer {
 	cl := (*membership.RaftCluster)(clp)
 
 	// Use etcd's own configured logger (level, sinks, encoding) rather than
-	// manufacturing a fresh one per call via Logger(); Start re-names it "s3raft".
-	lg := b.lg.Named("s3raft")
+	// manufacturing a fresh one per call via Logger(); Start re-names it "libraft".
+	lg := b.lg.Named("libraft")
 
 	// The etcd cluster ID, unavailable to the StartNode seam. Logged for now; a
 	// productionized version would thread it into ActiveNS as the namespace key.
-	lg.Info("s3raft: newRaftNode has cluster ID",
+	lg.Info("libraft: newRaftNode has cluster ID",
 		zap.String("cluster-id", cl.ID().String()),
 		zap.String("active-ns", ActiveNS))
 
 	// Deviation from etcd's own newRaftNode: it also stores the returned node in
 	// the package-level etcdserver.raftStatus indirection that backs the
 	// /debug/vars "raft.status" expvar. That symbol is unexported and
-	// unreachable from here, so the expvar is absent under s3raft. Harmless
+	// unreachable from here, so the expvar is absent under libraft. Harmless
 	// (debug-only) and documented in v3/LIMITATIONS.md; not a regression.
 	n, err := Start(b.lg, os.Getenv(EnvURL), b.config.ID, ActiveNS, b.peers, b.storage)
 	if err != nil {
-		panic(fmt.Sprintf("s3raft: start: %v", err))
+		panic(fmt.Sprintf("libraft: start: %v", err))
 	}
 
 	r := &RaftNode{

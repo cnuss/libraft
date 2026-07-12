@@ -22,8 +22,8 @@ Deep-link by filename; line numbers will drift.
 | `S3OpenBackend`, checkpoint/restore, guards    | [`v3/checkpoint.go`](./v3/checkpoint.go)                         |
 | Core unit tests                                | [`v3/cas_linearizability_test.go`](./v3/cas_linearizability_test.go) |
 | e2e harness + runner                           | [`e2e/e2e_test.go`](./e2e/e2e_test.go)                           |
-| e2e MinIO/S3 store harness                     | [`e2e/s3raft_test.go`](./e2e/s3raft_test.go)                     |
-| s3raft-enabled etcd binary (drives etcd's e2e) | [`e2e/main.go`](./e2e/main.go)                                   |
+| e2e MinIO/S3 store harness                     | [`e2e/libraft_test.go`](./e2e/libraft_test.go)                     |
+| libraft-enabled etcd binary (drives etcd's e2e) | [`e2e/main.go`](./e2e/main.go)                                   |
 | etcd-e2e CI job (baseline vs reflect)          | [`.github/workflows/ci.yml`](./.github/workflows/ci.yml)         |
 | Worked examples                                | [`examples/`](./examples)                                        |
 | Build / lint / test commands                   | [`Makefile`](./Makefile)                                         |
@@ -40,8 +40,8 @@ Three packages:
 
 ```
 github.com/cnuss/libraft             — the import seam: blank-import this to
-                                     install s3raft (re-exports EnvURL).
-github.com/cnuss/libraft/v3          — s3raft core: S3 CAS log, raft.Node over
+                                     install libraft (re-exports EnvURL).
+github.com/cnuss/libraft/v3          — libraft core: S3 CAS log, raft.Node over
                                      the log, bbolt checkpoint/restore, notify,
                                      batch, metrics.
 github.com/cnuss/libraft/v3/reflect  — the installer: monkey-patches etcd's
@@ -51,7 +51,7 @@ github.com/cnuss/libraft/v3/reflect  — the installer: monkey-patches etcd's
 [`e2e/`](./e2e) is a **separate Go module** (`github.com/cnuss/libraft/e2e`,
 `replace`d onto the checkout): it carries the deps only the harness needs —
 the docker SDK for the MinIO container and etcd's `etcdmain` tree for the
-`etcd-s3raft` binary — so they never enter the library's dependency graph.
+`etcd-libraft` binary — so they never enter the library's dependency graph.
 `./...` from the root skips it; the Makefile's `-C e2e` legs cover it.
 
 A host blank-imports the root package (which pulls in `v3/reflect`); the
@@ -70,14 +70,14 @@ source edit (see the patch-target rules under Conventions that bite).
 The `v3` core was ported out of an etcd fork — `server/etcdserver/s3raft/*` at
 commit `0ab3790793d54f7709d9c9b62175d200aadb483e` (2026-07-09) — and split into
 the core/installer layout here on 2026-07-10. It was a **copy, not a move**:
-that etcd tree still carries its own flat `s3raft` package (installer files
+that etcd tree still carries its own flat `libraft` package (installer files
 inline) plus an e2e harness that builds `bin/etcd` with the blank import and
 drives it against a real bucket. If libraft becomes the source of truth,
 delete the etcd copy and have that tree blank-import
 `github.com/cnuss/libraft/v3/reflect`. The bucket-backed pieces already live
-here: the `e2e/` module carries the s3raft-enabled etcd binary (`e2e/main.go`,
+here: the `e2e/` module carries the libraft-enabled etcd binary (`e2e/main.go`,
 driven by the etcd-e2e CI job against etcd's own suite) and a MinIO-backed
-harness (`e2e/s3raft_test.go`).
+harness (`e2e/libraft_test.go`).
 
 ## Local development
 
@@ -91,7 +91,7 @@ git clone https://github.com/cnuss/libraft.git
 cd libraft
 make test   # library unit + fuzz tests (fast, in-package)
 make e2e    # builds and runs every example binary; without AWS_REGION it
-            # starts a throwaway MinIO container (docker) for the s3raft legs
+            # starts a throwaway MinIO container (docker) for the libraft legs
 ```
 
 Run a specific example locally:
@@ -111,10 +111,10 @@ Three tiers, each with a distinct job — don't blur them:
   example demonstrates; it never asserts. Assertion logic belongs in `e2e/`.
 - **`e2e/`** — the harness builds and runs the example binaries and asserts
   on their output. If a check can pass without running an example binary, it
-  is a unit test, not e2e. Its own module (see Module layout); the s3raft legs
+  is a unit test, not e2e. Its own module (see Module layout); the libraft legs
   run against a real store — ambient AWS env when `AWS_REGION` is set, a
   docker-launched MinIO otherwise (skipped where no linux-container daemon is
-  reachable). The same module also builds `etcd-s3raft` (`e2e/main.go`), the
+  reachable). The same module also builds `etcd-libraft` (`e2e/main.go`), the
   binary the etcd-e2e CI job substitutes into etcd's own e2e suite.
 
 ## Before you push
@@ -202,7 +202,7 @@ to the README's example table.
 
 Reconciled 2026-07-10. The landed work (fencing epochs, lessor fencing,
 snapshot→bucket + log truncation, batching, SQS notification, 429/503 backoff,
-force-new-cluster) makes s3raft credible for low-write control planes (see
+force-new-cluster) makes libraft credible for low-write control planes (see
 [README → When to use it](./README.md#when-to-use-it)); these gaps are what's
 left:
 
@@ -222,7 +222,7 @@ left:
 3. **Config surface** — `ETCD_S3LOG_URL` env var only; wants a proper
    `--experimental-s3-log-url` flag + feature gate per etcd conventions. (The
    bucket-backed e2e harness has landed in the `e2e/` module — MinIO via the
-   docker SDK plus the `etcd-s3raft` binary for etcd's own suite.)
+   docker SDK plus the `etcd-libraft` binary for etcd's own suite.)
 4. **Concurrency correctness pass** — Jepsen-style: `kill -9` loops,
    partitioned S3 access, clock skew; validate no lost/duplicated acks. The
    CAS core should survive; leases are the risk.
@@ -241,10 +241,9 @@ left:
    reconcile / force-new); extract sigv4 signing from `client.go`;
    `checkpoint.go` mixes backend-open, namespace derivation, checkpoint and
    guards; `package reflect` shadows the stdlib package it imports (a rename
-   breaks the import path — decide before tagging v3); the boot logger is
-   double-named `s3raft.s3raft`; `proto.Uint64` → `new()`, `sort.Slice` →
-   `slices.Sort`; scope the vet `-unsafeptr` exception to `v3/reflect` instead
-   of tree-wide.
+   breaks the import path — decide before tagging v3); `proto.Uint64` →
+   `new()`, `sort.Slice` → `slices.Sort`; scope the vet `-unsafeptr` exception
+   to `v3/reflect` instead of tree-wide.
 
 ## Branch / PR flow
 

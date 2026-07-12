@@ -37,7 +37,7 @@ import (
 //
 // e2e requires a live SQS queue wired to the bucket; the event parsing is unit
 // tested (notify_sqs_test.go). SigV4 for the "sqs" service is hand-rolled to
-// keep s3raft dependency-free, mirroring the S3 signer in client.go.
+// keep libraft dependency-free, mirroring the S3 signer in client.go.
 type SQSNotifier struct {
 	QueueURL     string // https://sqs.<region>.amazonaws.com/<acct>/<queue>
 	Region       string
@@ -159,7 +159,7 @@ func (s *SQSNotifier) receive(ctx context.Context) ([]sqsMessage, error) {
 		} `xml:"ReceiveMessageResult>Message"`
 	}
 	if err := xml.Unmarshal(body, &parsed); err != nil {
-		return nil, fmt.Errorf("s3raft: sqs receive: bad xml: %w", err)
+		return nil, fmt.Errorf("libraft: sqs receive: bad xml: %w", err)
 	}
 	out := make([]sqsMessage, 0, len(parsed.Messages))
 	for _, m := range parsed.Messages {
@@ -228,7 +228,7 @@ func (s *SQSNotifier) call(ctx context.Context, form url.Values) ([]byte, error)
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("s3raft: sqs %s: status %d", form.Get("Action"), resp.StatusCode)
+		return nil, fmt.Errorf("libraft: sqs %s: status %d", form.Get("Action"), resp.StatusCode)
 	}
 	return b, nil
 }

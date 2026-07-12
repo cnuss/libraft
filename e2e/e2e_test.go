@@ -40,8 +40,8 @@ func (r *runner) run(t *testing.T, extraEnv []string, args ...string) (string, i
 	t.Helper()
 	cmd := exec.Command(r.bin, args...)
 	// Hermetic: strip ETCD_S3LOG_URL so an ambient value (e.g. exported by the
-	// etcd-e2e job) can't flip an example into s3raft mode behind a test's
-	// back. Tests that want s3raft mode pass the URL via extraEnv, which is
+	// etcd-e2e job) can't flip an example into libraft mode behind a test's
+	// back. Tests that want libraft mode pass the URL via extraEnv, which is
 	// appended after the filter and therefore wins.
 	env := os.Environ()
 	filtered := env[:0]

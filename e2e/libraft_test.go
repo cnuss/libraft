@@ -17,20 +17,20 @@ import (
 	"github.com/docker/go-connections/nat"
 )
 
-// The s3raft e2e legs need a real S3-compatible store. Two ways to get one:
+// The libraft e2e legs need a real S3-compatible store. Two ways to get one:
 //
 //   - AWS_REGION set: the environment brings its own store; ETCD_S3LOG_URL
 //     must point at it and the ambient AWS credentials are used as-is.
 //   - AWS_REGION unset: the harness starts a throwaway MinIO container via
 //     the docker SDK, torn down in TestMain. Where no linux-container docker
-//     daemon is reachable (macOS/windows CI cells) the s3raft tests skip.
+//     daemon is reachable (macOS/windows CI cells) the libraft tests skip.
 const minioImage = "minio/minio:latest"
 
 var s3store struct {
 	once    sync.Once
 	env     []string // extra env for example runs (URL + credentials)
-	skip    string   // non-empty: skip s3raft tests with this reason
-	err     error    // non-nil: fail s3raft tests (misconfiguration, not absence)
+	skip    string   // non-empty: skip libraft tests with this reason
+	err     error    // non-nil: fail libraft tests (misconfiguration, not absence)
 	cleanup func()
 }
 
@@ -61,7 +61,7 @@ func setupS3() {
 	if os.Getenv("AWS_REGION") != "" {
 		url := os.Getenv("ETCD_S3LOG_URL")
 		if url == "" {
-			s3store.err = fmt.Errorf("AWS_REGION is set but ETCD_S3LOG_URL is not; point it at the store the s3raft e2e should use")
+			s3store.err = fmt.Errorf("AWS_REGION is set but ETCD_S3LOG_URL is not; point it at the store the libraft e2e should use")
 			return
 		}
 		s3store.env = []string{"ETCD_S3LOG_URL=" + url}
@@ -90,7 +90,7 @@ func setupS3() {
 
 	// Daemon is present and can run the image: from here on, failures are
 	// real infrastructure errors, not absence — fail rather than skip so CI
-	// can't go green by silently losing the s3raft legs.
+	// can't go green by silently losing the libraft legs.
 	rc, err := cli.ImagePull(ctx, minioImage, image.PullOptions{})
 	if err != nil {
 		cli.Close()
@@ -163,10 +163,10 @@ func setupS3() {
 	}
 }
 
-// TestS3raftBasic runs the basic example twice against the store: the first
-// run writes through s3raft; the second starts from a brand-new data dir and
+// TestLibraftBasic runs the basic example twice against the store: the first
+// run writes through libraft; the second starts from a brand-new data dir and
 // must read the value back out of the S3 log alone.
-func TestS3raftBasic(t *testing.T) {
+func TestLibraftBasic(t *testing.T) {
 	env := s3Env(t)
 	r := newRunner(t, "basic")
 
@@ -175,7 +175,7 @@ func TestS3raftBasic(t *testing.T) {
 		t.Fatalf("first run exited %d, want 0", code)
 	}
 	for _, want := range []string{
-		"s3raft active",
+		"libraft active",
 		`wrote and read back: message="hello from libraft"`,
 	} {
 		if !strings.Contains(out, want) {

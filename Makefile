@@ -51,7 +51,7 @@ test:
 # End-to-end: the harness builds and drives every example binary. -count=1 disables
 # go test caching, since the harness builds the example binaries at runtime and the
 # cache key wouldn't otherwise pick up example source changes. Without AWS_REGION
-# the harness starts a throwaway MinIO container for the s3raft legs (skipping
+# the harness starts a throwaway MinIO container for the libraft legs (skipping
 # them where no linux-container docker daemon is reachable).
 e2e:
 	go test -C e2e -count=1 -v .

@@ -1,4 +1,4 @@
-// Command basic runs an out-of-the-box embedded etcd with s3raft installed.
+// Command basic runs an out-of-the-box embedded etcd with libraft installed.
 //
 // The blank import of github.com/cnuss/libraft below is the entire
 // integration: when ETCD_S3LOG_URL is set it monkey-patches etcd's raft entry
@@ -32,7 +32,7 @@ import (
 	"go.etcd.io/etcd/server/v3/embed"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/v3client"
 
-	// Installs s3raft into etcd; activated by ETCD_S3LOG_URL.
+	// Installs libraft into etcd; activated by ETCD_S3LOG_URL.
 	_ "github.com/cnuss/libraft"
 )
 
@@ -47,12 +47,12 @@ func main() {
 
 func run() error {
 	if url := os.Getenv("ETCD_S3LOG_URL"); url != "" {
-		fmt.Printf("s3raft active: raft log stored at %s\n", url)
+		fmt.Printf("libraft active: raft log stored at %s\n", url)
 	} else {
-		fmt.Println("s3raft inactive; set ETCD_S3LOG_URL to store the raft log in S3")
+		fmt.Println("libraft inactive; set ETCD_S3LOG_URL to store the raft log in S3")
 	}
 
-	// A fresh data directory every run: with s3raft active the server restores
+	// A fresh data directory every run: with libraft active the server restores
 	// its state from the S3 log, so nothing needs to survive locally.
 	dir, err := os.MkdirTemp("", "libraft-basic-*")
 	if err != nil {
@@ -82,7 +82,7 @@ func run() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// A value put by a previous run shows up here — with s3raft active it was
+	// A value put by a previous run shows up here — with libraft active it was
 	// restored from S3, since the data directory above is brand new.
 	if prev, err := cli.Get(ctx, "message"); err == nil && len(prev.Kvs) > 0 {
 		fmt.Printf("restored from a previous run: message=%q\n", prev.Kvs[0].Value)
