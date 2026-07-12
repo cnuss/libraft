@@ -22,6 +22,9 @@ Deep-link by filename; line numbers will drift.
 | `S3OpenBackend`, checkpoint/restore, guards    | [`v3/checkpoint.go`](./v3/checkpoint.go)                         |
 | Core unit tests                                | [`v3/cas_linearizability_test.go`](./v3/cas_linearizability_test.go) |
 | e2e harness + runner                           | [`e2e/e2e_test.go`](./e2e/e2e_test.go)                           |
+| e2e MinIO/S3 store harness                     | [`e2e/s3raft_test.go`](./e2e/s3raft_test.go)                     |
+| s3raft-enabled etcd binary (drives etcd's e2e) | [`e2e/main.go`](./e2e/main.go)                                   |
+| etcd-e2e CI job (baseline vs reflect)          | [`.github/workflows/ci.yml`](./.github/workflows/ci.yml)         |
 | Worked examples                                | [`examples/`](./examples)                                        |
 | Build / lint / test commands                   | [`Makefile`](./Makefile)                                         |
 | Release + skip release regex                   | [`.github/workflows/ci.yml`](./.github/workflows/ci.yml)         |
@@ -45,6 +48,12 @@ github.com/cnuss/libraft/v3/reflect  — the installer: monkey-patches etcd's
                                      raft construction into the core.
 ```
 
+[`e2e/`](./e2e) is a **separate Go module** (`github.com/cnuss/libraft/e2e`,
+`replace`d onto the checkout): it carries the deps only the harness needs —
+the docker SDK for the MinIO container and etcd's `etcdmain` tree for the
+`etcd-s3raft` binary — so they never enter the library's dependency graph.
+`./...` from the root skips it; the Makefile's `-C e2e` legs cover it.
+
 A host blank-imports the root package (which pulls in `v3/reflect`); the
 installer's `init` (when `ETCD_S3LOG_URL` is set) rewrites the prologue of
 `(*bootstrappedRaft).newRaftNode` and `serverstorage.OpenBackend` to jump into
@@ -65,8 +74,10 @@ that etcd tree still carries its own flat `s3raft` package (installer files
 inline) plus an e2e harness that builds `bin/etcd` with the blank import and
 drives it against a real bucket. If libraft becomes the source of truth,
 delete the etcd copy and have that tree blank-import
-`github.com/cnuss/libraft/v3/reflect`; the bucket-backed e2e harness should
-migrate into a `tests/` tree here (see Roadmap).
+`github.com/cnuss/libraft/v3/reflect`. The bucket-backed pieces already live
+here: the `e2e/` module carries the s3raft-enabled etcd binary (`e2e/main.go`,
+driven by the etcd-e2e CI job against etcd's own suite) and a MinIO-backed
+harness (`e2e/s3raft_test.go`).
 
 ## Local development
 
@@ -79,7 +90,8 @@ reconcile deliberately).
 git clone https://github.com/cnuss/libraft.git
 cd libraft
 make test   # library unit + fuzz tests (fast, in-package)
-make e2e    # builds and runs every example binary
+make e2e    # builds and runs every example binary; without AWS_REGION it
+            # starts a throwaway MinIO container (docker) for the s3raft legs
 ```
 
 Run a specific example locally:
@@ -99,12 +111,16 @@ Three tiers, each with a distinct job — don't blur them:
   example demonstrates; it never asserts. Assertion logic belongs in `e2e/`.
 - **`e2e/`** — the harness builds and runs the example binaries and asserts
   on their output. If a check can pass without running an example binary, it
-  is a unit test, not e2e.
+  is a unit test, not e2e. Its own module (see Module layout); the s3raft legs
+  run against a real store — ambient AWS env when `AWS_REGION` is set, a
+  docker-launched MinIO otherwise (skipped where no linux-container daemon is
+  reachable). The same module also builds `etcd-s3raft` (`e2e/main.go`), the
+  binary the etcd-e2e CI job substitutes into etcd's own e2e suite.
 
 ## Before you push
 
 - `gofmt -w .`
-- `go vet ./...`
+- `make vet` (covers the root and `e2e/` modules)
 - `make test`
 - `make e2e`
 
@@ -204,9 +220,9 @@ left:
    S3 needs multipart. Related: request-pricing telemetry, IAM-scoped creds,
    TLS review.
 3. **Config surface** — `ETCD_S3LOG_URL` env var only; wants a proper
-   `--experimental-s3-log-url` flag + feature gate per etcd conventions, and
-   the bucket-backed e2e harness moved from the etcd fork into a `tests/`
-   tree here.
+   `--experimental-s3-log-url` flag + feature gate per etcd conventions. (The
+   bucket-backed e2e harness has landed in the `e2e/` module — MinIO via the
+   docker SDK plus the `etcd-s3raft` binary for etcd's own suite.)
 4. **Concurrency correctness pass** — Jepsen-style: `kill -9` loops,
    partitioned S3 access, clock skew; validate no lost/duplicated acks. The
    CAS core should survive; leases are the risk.

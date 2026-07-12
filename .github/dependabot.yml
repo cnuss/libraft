@@ -12,7 +12,9 @@
 version: 2
 updates:
   - package-ecosystem: gomod
-    directory: "/"
+    # "/" is the library; "/e2e" is the harness's own module (docker SDK +
+    # etcdmain dep trees that must stay out of the library's graph).
+    directories: ["/", "/e2e"]
     schedule:
       interval: weekly
     # Only bump direct dependencies. The indirect graph floats with the direct

@@ -141,9 +141,14 @@ make test   # library unit + fuzz tests (fast, in-package)
 make e2e    # builds and runs every example binary, asserts its output
 ```
 
-`make e2e` runs `go test -count=1 -v ./e2e`. The `-count=1` defeats the test
-cache, since the harness builds the example binaries at runtime and the cache
-key wouldn't otherwise pick up example source changes.
+`make e2e` runs `go test -C e2e -count=1 -v .` — the harness lives in its own
+module so its deps (docker SDK, `etcdmain`) stay out of the library's graph.
+The `-count=1` defeats the test cache, since the harness builds the example
+binaries at runtime and the cache key wouldn't otherwise pick up example
+source changes. The s3raft legs need a real S3-compatible store: with
+`AWS_REGION` set the ambient AWS env is used (`ETCD_S3LOG_URL` must point at
+the store); without it the harness starts a throwaway MinIO container via
+docker, and skips those legs where no linux-container daemon is reachable.
 
 ## Contributing
 
