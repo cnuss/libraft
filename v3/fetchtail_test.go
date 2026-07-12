@@ -59,3 +59,33 @@ func TestFetchTailConcurrentOrder(t *testing.T) {
 		}
 	}
 }
+
+// TestConfirmReadFoldsParallelReads checks the parallelized confirmRead still
+// advances to the store's committed tail and reports it — the epoch read and
+// the tail fetch run concurrently, then fold on the calling goroutine. Run
+// under -race it also guards those concurrent reads.
+func TestConfirmReadFoldsParallelReads(t *testing.T) {
+	ms := newMemStore()
+	if _, err := ms.bumpEpoch(1); err != nil { // epoch 1, owner 1
+		t.Fatalf("bumpEpoch: %v", err)
+	}
+	const N = 5
+	for i := 1; i <= N; i++ {
+		body, err := encodeEntries([]*raftpb.Entry{{Index: proto.Uint64(uint64(i)), Term: proto.Uint64(1)}})
+		if err != nil {
+			t.Fatalf("encode %d: %v", i, err)
+		}
+		if err := ms.put(logKey(uint64(i)), body); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+
+	n := &node{id: 1, cli: ms, lg: zap.NewNop(), voters: map[uint64]struct{}{}, myEpoch: 1}
+	idx, ok := n.confirmRead()
+	if !ok {
+		t.Fatal("confirmRead denied, want ok")
+	}
+	if idx != N || n.lastIndex != N {
+		t.Fatalf("idx=%d lastIndex=%d, want %d", idx, n.lastIndex, N)
+	}
+}
