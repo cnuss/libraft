@@ -1177,12 +1177,15 @@ func (n *node) publishApplied(ctx context.Context) {
 // within ~ms, so an auth-heavy setup no longer pays a fixed second-plus per op.
 // Runs on the run goroutine (the proposer), like the sleep it replaces.
 func (n *node) awaitPropagation(target uint64) {
-	deadline := n.clk.Now().Add(propagationDelay)
+	start := n.clk.Now() // DIAG
+	deadline := start.Add(propagationDelay)
 	for {
 		if n.peersAppliedAtLeast(target) {
+			n.lg.Info("libraft: BARRIER confirmed", zap.Uint64("target", target), zap.Duration("waited", n.clk.Since(start))) // DIAG
 			return
 		}
 		if !n.clk.Now().Before(deadline) {
+			n.lg.Info("libraft: BARRIER deadline", zap.Uint64("target", target), zap.Duration("waited", n.clk.Since(start))) // DIAG
 			return
 		}
 		n.clk.Sleep(propagationCheckInterval)
@@ -1442,6 +1445,7 @@ func (n *node) deliver(r readResult) {
 func (n *node) startLinRead(rctx []byte) {
 	base := n.lastIndex
 	chain := n.cli.chainMode()
+	rdStart := n.clk.Now() // DIAG
 	go func() {
 		r := readResult{kind: readLin, rctx: rctx, chain: chain}
 		var wg sync.WaitGroup
@@ -1453,6 +1457,7 @@ func (n *node) startLinRead(rctx []byte) {
 			go func() { defer wg.Done(); r.h, r.hErr = n.cli.readHead() }()
 		}
 		wg.Wait()
+		n.lg.Info("libraft: LINREAD reads done", zap.Duration("took", n.clk.Since(rdStart)), zap.Bool("chain", chain)) // DIAG
 		n.deliver(r)
 	}()
 }
