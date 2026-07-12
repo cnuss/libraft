@@ -29,6 +29,7 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 
+	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
 	"go.etcd.io/raft/v3/tracker"
@@ -1027,19 +1028,30 @@ drain:
 		}
 	}
 	err := n.appendBatch(batch)
-	if err == nil && addsMember(batch) {
-		// Propagation barrier. A member add is committed the instant its log
+	if err == nil && (addsMember(batch) || mutatesAuth(batch)) {
+		// Propagation barrier. A proposal is committed the instant its log
 		// object is CAS-written, but peers learn of it only by *pulling* the
 		// shared log (libraft sends no raft traffic), so an existing member can
-		// still be serving a membership view that predates this add. etcd's
-		// MemberAdd returns as soon as *this* node applies the ConfChange, and
-		// the caller immediately starts the new member, which validates its
-		// config against an existing peer's /members — if that peer has not yet
-		// pulled the add, bootstrap fails ("member count is unequal" /
-		// "could not retrieve cluster information"). Holding the ConfChange here
-		// (before run() emits it as a committed entry, which is what unblocks
-		// MemberAdd) gives every peer a full poll interval to catch up first.
-		n.clk.Sleep(memberChangePropagationDelay)
+		// still be serving state that predates this commit. Two cases need the
+		// caller held until peers catch up, both because the caller's *next*
+		// action targets a peer that must already have applied this entry:
+		//
+		//   - Member add: etcd's MemberAdd returns as soon as *this* node
+		//     applies the ConfChange, and the caller immediately starts the new
+		//     member, which validates its config against an existing peer's
+		//     /members — if that peer has not yet pulled the add, bootstrap
+		//     fails ("member count is unequal" / "could not retrieve cluster
+		//     information").
+		//   - Auth mutation: Authenticate assigns a token in each member's
+		//     local authStore only when that member applies the entry, so a
+		//     token handed back by this node is rejected ("invalid auth token")
+		//     by any peer that has not yet pulled it; auth enable/user/role
+		//     writes are the same shape.
+		//
+		// Holding here (before run() emits the committed entry, which is what
+		// unblocks the caller) gives every peer a full poll interval to catch
+		// up first.
+		n.clk.Sleep(propagationDelay)
 	}
 	for _, p := range batch {
 		if p.resc != nil {
@@ -1048,11 +1060,11 @@ drain:
 	}
 }
 
-// memberChangePropagationDelay bounds how long a member add is held on the
-// serving node before MemberAdd returns, so peers pull the change first. It
-// exceeds pollInterval so a peer whose change-notification stream is degraded
-// still catches up via the poll fallback within the window.
-const memberChangePropagationDelay = pollInterval + 500*time.Millisecond
+// propagationDelay bounds how long a member add or auth mutation is held on the
+// serving node before the proposing call returns, so peers pull the change
+// first. It exceeds pollInterval so a peer whose change-notification stream is
+// degraded still catches up via the poll fallback within the window.
+const propagationDelay = pollInterval + 500*time.Millisecond
 
 // addsMember reports whether the batch contains a ConfChange that adds a member
 // (voter or learner) — the case that a freshly started member's bootstrap must
@@ -1077,6 +1089,35 @@ func addsMember(batch []proposal) bool {
 					}
 				}
 			}
+		}
+	}
+	return false
+}
+
+// mutatesAuth reports whether the batch contains a normal proposal that changes
+// auth state (enable/disable, authenticate, or a user/role write). Each such
+// entry only takes effect on a member once that member applies it, so the
+// caller must be held until peers catch up (see the propagation barrier in
+// handleProposals) — most acutely for Authenticate, whose freshly issued token
+// is otherwise rejected as "invalid auth token" by any peer that has not yet
+// pulled it. Read-only auth requests (status/get/list) are deliberately
+// excluded: they mutate nothing, so no peer has to catch up.
+func mutatesAuth(batch []proposal) bool {
+	for _, p := range batch {
+		if p.typ != raftpb.EntryNormal || len(p.data) == 0 {
+			continue
+		}
+		var r pb.InternalRaftRequest
+		if proto.Unmarshal(p.data, &r) != nil {
+			continue
+		}
+		switch {
+		case r.AuthEnable != nil, r.AuthDisable != nil, r.Authenticate != nil,
+			r.AuthUserAdd != nil, r.AuthUserDelete != nil, r.AuthUserChangePassword != nil,
+			r.AuthUserGrantRole != nil, r.AuthUserRevokeRole != nil,
+			r.AuthRoleAdd != nil, r.AuthRoleDelete != nil,
+			r.AuthRoleGrantPermission != nil, r.AuthRoleRevokePermission != nil:
+			return true
 		}
 	}
 	return false
