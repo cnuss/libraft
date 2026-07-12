@@ -406,7 +406,10 @@ jobs:
         # MinIO container), so the per-run prefix must go even when tests
         # fail. Credentials are the job-scoped assume-role exports; if the
         # role assumption itself failed there's nothing to purge.
-        if: always() && matrix.mode == 'reflect-aws' && steps.s3url.outcome == 'success'
+        # TEMP DISABLED (#50 debugging): the extra `vars.PURGE_S3_PREFIX` guard
+        # keeps the run prefix in the bucket for inspection (the var isn't set).
+        # Restore by deleting that clause before merge.
+        if: always() && matrix.mode == 'reflect-aws' && steps.s3url.outcome == 'success' && vars.PURGE_S3_PREFIX == 'true'
         run: |
           aws s3 rm --recursive \
             "s3://${{ steps.s3url.outputs.bucket }}/${{ steps.s3url.outputs.prefix }}" || true
