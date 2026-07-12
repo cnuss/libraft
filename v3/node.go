@@ -1195,7 +1195,7 @@ func (n *node) awaitPropagation(target uint64) {
 // deadline. Reads voters under membMu; issues one store GET per peer.
 func (n *node) peersAppliedAtLeast(target uint64) bool {
 	for _, id := range n.otherVoters() {
-		body, err := n.cli.get(memberKey(id))
+		body, err := n.cli.getOnce(memberKey(id))
 		if err != nil {
 			return false
 		}

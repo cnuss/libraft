@@ -77,6 +77,8 @@ func (m *memStore) get(key string) ([]byte, error) {
 	return append([]byte(nil), b...), nil
 }
 
+func (m *memStore) getOnce(key string) ([]byte, error) { return m.get(key) }
+
 func (m *memStore) put(key string, body []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

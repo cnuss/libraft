@@ -647,6 +647,26 @@ func (c *client) get(key string) ([]byte, error) {
 	return body, err
 }
 
+// getOnce reads key with a single HTTP attempt bounded by markerReadTimeout, no
+// retry budget. A slow or transiently-erroring object returns an error promptly
+// so the caller (the propagation barrier) can honor its own short deadline
+// instead of blocking on the 12s write-path budget. errNotFound on 404.
+func (c *client) getOnce(key string) ([]byte, error) {
+	deadline := c.clk.Now().Add(markerReadTimeout)
+	status, body, _, err := c.doOnce(http.MethodGet, c.prefix+key, nil, nil, nil, deadline)
+	if err != nil {
+		return nil, err
+	}
+	switch status {
+	case http.StatusOK:
+		return body, nil
+	case http.StatusNotFound:
+		return nil, errNotFound
+	default:
+		return nil, fmt.Errorf("libraft: getOnce %s: unexpected status %d", key, status)
+	}
+}
+
 type listResult struct {
 	Keys        []string `xml:"Contents>Key"`
 	IsTruncated bool     `xml:"IsTruncated"`
@@ -694,6 +714,10 @@ const (
 	// store cannot block a caller (notably the single-threaded run loop) past
 	// roughly this bound.
 	s3RetryBudget = 12 * time.Second
+	// markerReadTimeout caps a single best-effort getOnce (the propagation
+	// barrier's applied-marker reads). Short so a slow/throttled read yields to
+	// the barrier's own deadline instead of consuming the 12s write budget.
+	markerReadTimeout = time.Second
 )
 
 // do performs a SigV4-signed request with bounded retries on transient faults —
