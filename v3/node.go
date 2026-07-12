@@ -1148,6 +1148,13 @@ func (n *node) publishApplied(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			// No peers -> no one reads this marker (the barrier is skipped on a
+			// single-member cluster), so skip the write entirely. This also keeps
+			// a busy single node (e.g. a stress test hammering the log) from
+			// spending store writes on markers nobody consumes.
+			if !n.hasPeers() {
+				continue
+			}
 			a := n.applied.Load()
 			if a == last {
 				continue
