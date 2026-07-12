@@ -114,9 +114,17 @@ jobs:
   # etcd-e2e: runs a subset of etcd's OWN e2e suite against two binaries and
   # compares:
   #
-  #   baseline — stock etcd (built from the pinned etcd checkout), no hijack.
-  #   reflect  — stock etcd + the libraft installer blank-imported (e2e/main.go),
-  #              ETCD_S3LOG_URL pointed at a MinIO container.
+  #   baseline    — stock etcd (built from the pinned etcd checkout), no hijack.
+  #   reflect     — stock etcd + the libraft installer blank-imported
+  #                 (e2e/main.go), ETCD_S3LOG_URL pointed at a MinIO container.
+  #   reflect-aws — the same hijacked binary against REAL AWS S3: credentials
+  #                 come from saml-to/assume-aws-role-action (exports AWS_* env
+  #                 for the rest of the job) using the AWS_ROLE_ARN repo
+  #                 variable. Runs a per-run prefix in a per-account bucket and
+  #                 purges it afterwards. Only scheduled into the matrix when
+  #                 the role variable exists and the run isn't a fork PR (forks
+  #                 get neither vars nor a token saml.to trusts) — see the
+  #                 modes output of the changes job.
   #
   # The hijacked binary is stock etcd with one blank import (etcdmain.Main is
   # exported), built from the isolated e2e module so etcdmain's deps never
@@ -142,6 +150,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       etcd-e2e: ${{ steps.filter.outputs.run }}
+      modes: ${{ steps.modes.outputs.modes }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -171,6 +180,24 @@ jobs:
           fi
           echo "run=$run" >> "$GITHUB_OUTPUT"
           echo "etcd-e2e gate: run=$run"
+
+      - name: e2e modes
+        id: modes
+        # matrix can't be conditioned per-cell with a job-level if, so the
+        # mode list itself is computed here. reflect-aws joins only when the
+        # AWS_ROLE_ARN variable exists and the run isn't a fork PR: forks see
+        # neither repo variables nor a GITHUB_TOKEN that saml.to's trust
+        # accepts, so the leg could only fail there.
+        run: |
+          set -euo pipefail
+          modes='["baseline","reflect"]'
+          if [ -n "${{ vars.AWS_ROLE_ARN }}" ] && \
+             { [ "${{ github.event_name }}" != "pull_request" ] || \
+               [ "${{ github.event.pull_request.head.repo.full_name }}" = "${{ github.repository }}" ]; }; then
+            modes='["baseline","reflect","reflect-aws"]'
+          fi
+          echo "modes=$modes" >> "$GITHUB_OUTPUT"
+          echo "etcd-e2e modes: $modes"
 
   etcd-e2e:
     needs: changes
@@ -203,7 +230,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mode: [baseline, reflect]
+        mode: ${{ fromJSON(needs.changes.outputs.modes) }}
     steps:
       - name: checkout libraft
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -229,14 +256,19 @@ jobs:
           ls -l bin/
           ./bin/etcd --version
 
-      - name: build hijacked etcd (reflect only)
-        if: matrix.mode == 'reflect'
+      - name: build hijacked etcd (reflect modes)
+        if: matrix.mode != 'baseline'
         working-directory: libraft/e2e
         run: |
           # Overwrite ONLY the server binary; etcdctl/etcdutl stay stock.
           CGO_ENABLED=0 go build -o "$GITHUB_WORKSPACE/etcd/bin/etcd" .
           "$GITHUB_WORKSPACE/etcd/bin/etcd" --version
 
+      # From here the store env (ETCD_S3LOG_URL + credentials) is exported to
+      # GITHUB_ENV per mode, so the run step needs no per-mode env plumbing:
+      # baseline exports nothing (installer no-ops), reflect exports the MinIO
+      # endpoint + static creds, reflect-aws gets AWS_* from the assume-role
+      # action and exports a composed real-S3 URL.
       - name: start MinIO (reflect only)
         if: matrix.mode == 'reflect'
         run: |
@@ -248,6 +280,37 @@ jobs:
             if curl -sf http://127.0.0.1:9000/minio/health/live; then echo ready; break; fi
             sleep 1
           done
+          {
+            echo "ETCD_S3LOG_URL=http://127.0.0.1:9000/etcd-e2e"
+            echo "AWS_ACCESS_KEY_ID=minioadmin"
+            echo "AWS_SECRET_ACCESS_KEY=minioadmin"
+          } >> "$GITHUB_ENV"
+
+      - name: assume AWS role (reflect-aws only)
+        if: matrix.mode == 'reflect-aws'
+        uses: saml-to/assume-aws-role-action@b7d7ce65384c7d07463e2313b71ccf8b35a147e0 # v1
+        with:
+          role: ${{ vars.AWS_ROLE_ARN }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: resolve S3 URL (reflect-aws only)
+        if: matrix.mode == 'reflect-aws'
+        id: s3url
+        # Bucket is per-account (names are globally unique; the client's
+        # ensureBucket creates it on first use). The prefix is per-run so runs
+        # never see each other's log/HEAD state in the persistent bucket; the
+        # purge step below removes it again.
+        run: |
+          set -euo pipefail
+          account=$(cut -d: -f5 <<< "${{ vars.AWS_ROLE_ARN }}")
+          bucket="libraft-e2e-${account}"
+          prefix="run-${{ github.run_id }}-${{ github.run_attempt }}"
+          url="https://s3.${AWS_DEFAULT_REGION}.amazonaws.com/${bucket}/${prefix}"
+          echo "bucket=$bucket" >> "$GITHUB_OUTPUT"
+          echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+          echo "ETCD_S3LOG_URL=$url" >> "$GITHUB_ENV"
+          echo "store: $url"
 
       # Isolate hijack startup from the e2e framework: run the hijacked binary
       # standalone with minimal single-node args and capture its FULL output.
@@ -297,11 +360,10 @@ jobs:
           # the reflect leg gets a stronger assertion that libraft doesn't leave
           # bbolt state etcd's verifier would reject.
           ETCD_VERIFY: all
-          # Only set for the reflect leg; the spawned etcd inherits this env, so
-          # the installer activates. Unset (baseline) => the installer no-ops.
-          ETCD_S3LOG_URL: ${{ matrix.mode == 'reflect' && 'http://127.0.0.1:9000/etcd-e2e' || '' }}
-          AWS_ACCESS_KEY_ID: ${{ matrix.mode == 'reflect' && 'minioadmin' || '' }}
-          AWS_SECRET_ACCESS_KEY: ${{ matrix.mode == 'reflect' && 'minioadmin' || '' }}
+          # ETCD_S3LOG_URL + AWS_* come from GITHUB_ENV, exported per mode by
+          # the MinIO / assume-role / resolve steps above; the spawned etcd
+          # inherits them, so the installer activates. Baseline exports
+          # nothing => the installer no-ops.
         run: |
           set -o pipefail  # without this, tee's exit 0 hides go test's failure
           if [ "${{ inputs.e2e-full }}" = "true" ]; then E2E_SUBSET=""; fi
@@ -338,6 +400,16 @@ jobs:
             e2e-${{ matrix.mode }}.log
             smoke.log
           if-no-files-found: warn
+
+      - name: purge S3 run prefix (reflect-aws only)
+        # always(): the bucket persists across runs (unlike the throwaway
+        # MinIO container), so the per-run prefix must go even when tests
+        # fail. Credentials are the job-scoped assume-role exports; if the
+        # role assumption itself failed there's nothing to purge.
+        if: always() && matrix.mode == 'reflect-aws' && steps.s3url.outcome == 'success'
+        run: |
+          aws s3 rm --recursive \
+            "s3://${{ steps.s3url.outputs.bucket }}/${{ steps.s3url.outputs.prefix }}" || true
 
   release:
     needs: [ci]
