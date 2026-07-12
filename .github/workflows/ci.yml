@@ -244,6 +244,26 @@ jobs:
           ref: ${{ env.ETCD_REF }}
           path: etcd
 
+      - name: raise etcd ctl-test timeouts for real-S3 latency (reflect-aws only)
+        if: matrix.mode == 'reflect-aws'
+        working-directory: etcd
+        # etcdctl-driven tests derive their wrapper timeout from dialTimeout:
+        # getTestTimeout() = 2*dialTimeout + 1s (tests/e2e/ctl_v3_test.go). At the
+        # stock 7s that's 15s — fine for a local MinIO but too tight for real-S3
+        # latency (~100ms/op over the network), so TestCtlV3AuthEndpointHealth's
+        # auth setup + endpoint-health probes overrun it. Bump the default so the
+        # derived wrapper (and etcdctl --dial-timeout, which prefixArgs sets from
+        # the same field) scale up to 2*60+1 = 121s. Fail loudly if the anchor
+        # line ever moves upstream rather than silently leaving 15s in place.
+        run: |
+          set -euo pipefail
+          f=tests/e2e/ctl_v3_test.go
+          grep -q 'dialTimeout: 7 \* time.Second' "$f" \
+            || { echo "timeout anchor not found in $f — etcd $ETCD_REF changed it; update this patch"; exit 1; }
+          sed -i 's/dialTimeout: 7 \* time.Second/dialTimeout: 60 * time.Second/' "$f"
+          grep -q 'dialTimeout: 60 \* time.Second' "$f" || { echo "timeout patch did not apply"; exit 1; }
+          echo "patched $f: dialTimeout 7s -> 60s (ctl wrapper timeout 15s -> 121s)"
+
       - name: setup go
         uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
@@ -325,6 +345,13 @@ jobs:
             echo "ETCD_S3LOG_SESSION_TOKEN=${AWS_SESSION_TOKEN}"
             echo "ETCD_S3LOG_REGION=${AWS_DEFAULT_REGION}"
           } >> "$GITHUB_ENV"
+          # Per-operation budget for the etcdctl commands the tests spawn (e.g.
+          # `endpoint health`, a linearizable read = several S3 GETs). The tests
+          # don't pass --command-timeout, so this ETCDCTL_ env is honored and the
+          # e2e framework forwards it (ETCDCTL_ prefix). Raised from the 5s
+          # default so a single slow real-S3 read doesn't report a healthy
+          # endpoint as unhealthy.
+          echo "ETCDCTL_COMMAND_TIMEOUT=30s" >> "$GITHUB_ENV"
 
       # Isolate hijack startup from the e2e framework: run the hijacked binary
       # standalone with minimal single-node args and capture its FULL output.
