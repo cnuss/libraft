@@ -988,6 +988,17 @@ func (n *node) voterSet() map[uint64]struct{} {
 	return m
 }
 
+// hasPeers reports whether the cluster currently has more than one voting
+// member, i.e. whether any *other* node exists that must pull a commit before a
+// client can observe it elsewhere. Used to gate the auth propagation barrier:
+// on a single-member cluster there is no peer to catch up, so the delay would
+// be pure dead time on every auth write.
+func (n *node) hasPeers() bool {
+	n.membMu.RLock()
+	defer n.membMu.RUnlock()
+	return len(n.voters) > 1
+}
+
 // sortedVotersLocked returns the voter member IDs sorted ascending. Caller must
 // hold membMu (RLock or Lock).
 func (n *node) sortedVotersLocked() []uint64 {
@@ -1028,7 +1039,11 @@ drain:
 		}
 	}
 	err := n.appendBatch(batch)
-	if err == nil && (addsMember(batch) || mutatesAuth(batch)) {
+	// A member add always barriers (even a 1->2 add: the pre-add node is the
+	// peer the new member validates against). An auth mutation only barriers
+	// when a peer actually exists to catch up — otherwise a single-member
+	// cluster pays the delay on every user/role write for no one's benefit.
+	if err == nil && (addsMember(batch) || (n.hasPeers() && mutatesAuth(batch))) {
 		// Propagation barrier. A proposal is committed the instant its log
 		// object is CAS-written, but peers learn of it only by *pulling* the
 		// shared log (libraft sends no raft traffic), so an existing member can
