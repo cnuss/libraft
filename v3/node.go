@@ -1350,6 +1350,15 @@ const (
 // read is still in flight (tailInFlight) — re-arms a single deferred poke so no
 // change is missed. Owned by run().
 func (n *node) syncTail() {
+	// A single-member cluster is the sole author of its log, so its tail is
+	// always current — every sync would read back only what it just wrote.
+	// Skip them: otherwise a change notifier (e.g. SQS) fires a blocking read
+	// on the run loop for each of this node's own appends, competing with the
+	// write path and roughly halving throughput under a write-heavy load.
+	// (Run-goroutine reads of voters are lockless; see membMu.)
+	if len(n.voters) <= 1 {
+		return
+	}
 	if d := n.clk.Since(n.lastSync); d < minSyncInterval {
 		if !n.resyncArmed {
 			n.resyncArmed = true
