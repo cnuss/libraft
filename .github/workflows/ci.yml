@@ -264,18 +264,26 @@ jobs:
           sed -i 's/dialTimeout: 7 \* time.Second/dialTimeout: 60 * time.Second/' "$f"
           grep -q 'dialTimeout: 60 \* time.Second' "$f" || { echo "dialTimeout patch did not apply"; exit 1; }
           echo "patched $f: dialTimeout 7s -> 60s (ctl wrapper 15s -> 121s)"
-          # (2) framework-internal probes derive from TickDuration, e.g.
-          # WaitMembersForLeader's per-Get budget = 10*TickDuration + 1s = 1.1s,
-          # which a post-restart linearizable read over real S3 blows (used by
-          # TestCtlV3LinearizableRead). TickDuration is test-timing only here (it
-          # is not wired into etcd's election/heartbeat flags), so bump it so the
-          # derived budget becomes 10*200ms + 1s = 3s.
-          g=tests/framework/config/cluster.go
-          grep -q 'TickDuration = 10 \* time.Millisecond' "$g" \
-            || { echo "TickDuration anchor not found in $g — etcd $ETCD_REF changed it; update this patch"; exit 1; }
-          sed -i 's/TickDuration = 10 \* time.Millisecond/TickDuration = 200 * time.Millisecond/' "$g"
-          grep -q 'TickDuration = 200 \* time.Millisecond' "$g" || { echo "TickDuration patch did not apply"; exit 1; }
-          echo "patched $g: TickDuration 10ms -> 200ms (WaitMembersForLeader get 1.1s -> 3s)"
+          # (2) WaitMembersForLeader (tests/framework/e2e/cluster.go) busy-loops a
+          # linearizable `get 0`, breaking only on success/"Key not found", inside
+          # a 30s WaitLeader budget. Each get is bounded by 10*TickDuration + 1s =
+          # 1.1s. A restart test (TestCtlV3LinearizableRead) makes the node replay
+          # its S3 log and re-establish the epoch before it can serve that read,
+          # which over real S3 exceeds 1.1s every attempt until the 30s fatal.
+          # Raise the two binding values surgically (not the shared TickDuration,
+          # whose sleeps feed other loops): per-get budget 1.1s -> 30s, and the
+          # WaitLeader ctx 30s -> 180s. If the read is merely slow this passes; if
+          # it never lands the job still fails, exposing a real recovery stall.
+          g=tests/framework/e2e/cluster.go
+          grep -q 'Timeout: 10\*config.TickDuration + time.Second' "$g" \
+            || { echo "WaitMembersForLeader get-timeout anchor not found in $g — etcd $ETCD_REF changed it"; exit 1; }
+          sed -i 's/Timeout: 10\*config.TickDuration + time.Second/Timeout: 30 * time.Second/' "$g"
+          grep -q 'context.WithTimeout(tb.Context(), 30\*time.Second)' "$g" \
+            || { echo "WaitLeader ctx anchor not found in $g — etcd $ETCD_REF changed it"; exit 1; }
+          sed -i 's/context.WithTimeout(tb.Context(), 30\*time.Second)/context.WithTimeout(tb.Context(), 180*time.Second)/' "$g"
+          grep -q 'Timeout: 30 \* time.Second' "$g" && grep -q 'tb.Context(), 180\*time.Second' "$g" \
+            || { echo "WaitMembersForLeader patches did not apply"; exit 1; }
+          echo "patched $g: WaitMembersForLeader get 1.1s -> 30s, WaitLeader ctx 30s -> 180s"
 
       - name: setup go
         uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
