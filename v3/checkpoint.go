@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"math"
 	"os"
 	"path/filepath"
@@ -88,11 +89,12 @@ var snapshotSource = func() backendSnapshotter {
 var (
 	capturedBackend backend.Backend
 	ActiveNS        string
-	// activeNSPath is the on-disk cache file for ActiveNS (nsFile(cfg)),
-	// captured in S3OpenBackend so newRaftNode — which has no ServerConfig but
-	// does have the authoritative cluster ID — can rewrite it when it rebinds
-	// the namespace (see rebindNamespace).
+	// activeNSPath is the on-disk cache file for ActiveNS (nsFile(cfg)), and
+	// activeNSRoot is the data-dir parent — both captured in S3OpenBackend so
+	// newRaftNode, which has no ServerConfig but does have the authoritative
+	// cluster ID, can recompute and rewrite the namespace (see rebindNamespace).
 	activeNSPath string
+	activeNSRoot string
 	// restoredIndex is the snapshot index the backend was restored from
 	// during disk-wiped recovery (0 if no restore happened). The node reads
 	// it to resume log replay past the snapshot.
@@ -135,6 +137,7 @@ func S3OpenBackend(cfg config.ServerConfig, hooks backend.Hooks) backend.Backend
 	lg := Logger().Named("libraft")
 	guardConfig(lg, cfg)
 	activeNSPath = nsFile(cfg)
+	activeNSRoot = dataDirParent(cfg)
 	ActiveNS = resolveNS(lg, cfg)
 	forceNewClusterPurge(lg, cfg)
 
@@ -305,7 +308,7 @@ func rebindNamespace(lg *zap.Logger, cl *membership.RaftCluster) {
 	if strings.TrimSpace(os.Getenv(EnvNS)) != "" {
 		return
 	}
-	ns := nsFromClusterID(cl.ID())
+	ns := nsKey(activeNSRoot, cl.ID())
 	if ns == ActiveNS {
 		return
 	}
@@ -318,21 +321,40 @@ func rebindNamespace(lg *zap.Logger, cl *membership.RaftCluster) {
 	}
 }
 
-// nsFromConfig derives the per-cluster bucket namespace from the real etcd
-// cluster ID, reconstructed from the same ServerConfig inputs etcd itself
-// hashes at bootstrap (see cidFromConfig). The cluster ID is globally unique per
-// cluster and frozen at genesis, so it is the ideal namespace key.
+// nsFromConfig derives the per-cluster bucket namespace from two orthogonal
+// inputs: the real etcd cluster ID and the parent of the member's data
+// directory.
 //
-// This value is authoritative ONLY for original bootstrap members: etcd freezes
-// the cluster ID by hashing the genesis member set, and never regenerates it on
-// AddMember. A member that joins LATER starts with --initial-cluster describing
-// the grown set, so cidFromConfig would hash the wrong set — that member instead
-// learns the frozen ID from the running cluster and has it rebound in
-// newRaftNode (see rebindNamespace). For such a joiner the ID derived here is
-// only used for the disk-wiped-restore probe, which is a no-op on a fresh member
-// anyway, so the transient mismatch is harmless.
+//   - The cluster ID (see cidFromConfig) is globally unique per cluster and
+//     frozen at genesis. It already folds in --initial-cluster-token and the
+//     member set (etcd hashes both), so it replaces the old token + lowest-peer-URL
+//     proxy AND is stable across membership changes — unlike the lowest-peer-URL
+//     projection, which shifted when the lowest member was removed.
+//   - The data-dir parent (the deployment's common root — /var/lib/etcd per host,
+//     or one temp root per test) discriminates otherwise-identical clusters that
+//     share a bucket. etcd's cluster ID is NOT unique across such clusters: the
+//     e2e suite runs dozens of single-node clusters all reusing peer URL
+//     localhost:20001 + token "new", which hash to one cluster ID — only their
+//     data-dir roots differ. Without this, they collide on one shared log.
+//
+// The cluster ID is authoritative ONLY for original bootstrap members: etcd
+// freezes it over the genesis member set and never regenerates it on AddMember.
+// A member that joins LATER starts with --initial-cluster describing the grown
+// set, so cidFromConfig would hash the wrong set — that member instead learns
+// the frozen ID from the running cluster and has it rebound in newRaftNode (see
+// rebindNamespace). For such a joiner the ID derived here is only used for the
+// disk-wiped-restore probe, a no-op on a fresh member, so the mismatch is
+// harmless. The data-dir parent is identical across all members of a cluster
+// (they share a deployment root), so it does not perturb this agreement.
 func nsFromConfig(lg *zap.Logger, cfg config.ServerConfig) string {
-	return nsFromClusterID(cidFromConfig(lg, cfg))
+	return nsKey(dataDirParent(cfg), cidFromConfig(lg, cfg))
+}
+
+// dataDirParent is the deployment root shared by every member of a cluster (the
+// parent of --data-dir), used to isolate clusters that share a bucket and a
+// cluster ID (see nsFromConfig).
+func dataDirParent(cfg config.ServerConfig) string {
+	return filepath.Dir(strings.TrimRight(cfg.DataDir, string(filepath.Separator)))
 }
 
 // cidFromConfig reconstructs the etcd cluster ID from ServerConfig by reusing
@@ -352,9 +374,20 @@ func cidFromConfig(lg *zap.Logger, cfg config.ServerConfig) types.ID {
 	return cl.ID()
 }
 
-// nsFromClusterID formats an etcd cluster ID as the bucket namespace prefix.
-func nsFromClusterID(id types.ID) string {
-	return fmt.Sprintf("c-%016x", uint64(id))
+// nsKey formats the bucket namespace prefix from the data-dir root and the etcd
+// cluster ID. The cluster ID stays legible (`c-<id>`); the root is folded in as
+// a hash so filesystem-path characters can't leak into the S3 key.
+func nsKey(root string, id types.ID) string {
+	return fmt.Sprintf("c-%016x-%016x", uint64(id), fnv64a(root))
+}
+
+// fnv64a hashes s with the standard 64-bit FNV-1a. It folds the data-dir root
+// into the namespace key (see nsKey); the value only needs to be stable and
+// well-distributed, not any particular basis.
+func fnv64a(s string) uint64 {
+	h := fnv.New64a()
+	h.Write([]byte(s))
+	return h.Sum64()
 }
 
 // prepareRestore downloads the latest bucket snapshot and stages it for

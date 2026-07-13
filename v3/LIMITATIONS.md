@@ -45,28 +45,39 @@ longer depends on operator discipline:
 
 ## Membership & restore
 
-Each cluster's objects live under a bucket namespace (`<bucket>/<prefix>/c-<id>/…`)
-keyed on the **real etcd cluster ID** (`nsFromConfig` / `rebindNamespace`,
-checkpoint.go) — cached on first boot in `<member>/libraft-ns`. The cluster ID is
-globally unique per cluster and frozen at genesis (etcd hashes the founding member
-set once and never regenerates it), so it is identical across members and stable
-across membership changes and disk-wiped restarts.
+Each cluster's objects live under a bucket namespace
+(`<bucket>/<prefix>/c-<cluster-id>-<root-hash>/…`, `nsFromConfig` / `rebindNamespace`,
+checkpoint.go) — cached on first boot in `<member>/libraft-ns`. Two orthogonal inputs
+key it:
 
-It reaches the namespace by two paths. In `S3OpenBackend` — which runs before the
-raft node exists — the ID is reconstructed from `ServerConfig` by reusing etcd's own
-`membership.NewClusterFromURLsMap` over `--initial-cluster-token` + `--initial-cluster`
-(the identical computation etcd's bootstrap performs). This is authoritative for the
-founding members and drives the disk-wiped-restore probe. In `newRaftNode` — the single
-seam that carries the authoritative `cl.ID()` — the namespace is **rebound** to it and
-re-cached: a no-op for founding members, and the correction for a member that *joined*
-later (whose `--initial-cluster` describes the grown set, so the config reconstruction
-would hash the wrong set). Because a fresh joiner's restore probe is a no-op, the
-transient config-derived value it uses before the rebind is harmless.
+- The **real etcd cluster ID** — globally unique per cluster and frozen at genesis
+  (etcd hashes the founding member set once, folding in `--initial-cluster-token`, and
+  never regenerates it on member add). It is identical across members and stable across
+  membership changes and disk-wiped restarts, and it *subsumes* the old token +
+  lowest-peer-URL proxy.
+- The **parent of the member's data directory** (the deployment root — `/var/lib/etcd`
+  per host, or one temp root per test). The cluster ID is *not* unique across clusters
+  that reuse the same member URLs and token: the e2e suite runs dozens of single-node
+  clusters all on `localhost:2380` + token `new`, which hash to one cluster ID. The
+  data-dir root discriminates them so they don't share one log. Identical across a
+  cluster's members (they share a deployment root), so it doesn't perturb agreement.
 
-- **Clusters that share one bucket are isolated by their cluster ID.** Two clusters
-  collide only if they share a cluster ID (same founding member set *and* token) *and*
-  the same bucket/prefix — give one a distinct token, initial-cluster, or bucket. A
-  single cluster per bucket/prefix needs no coordination.
+The cluster ID reaches the namespace by two paths. In `S3OpenBackend` — which runs
+before the raft node exists — it is reconstructed from `ServerConfig` by reusing etcd's
+own `membership.NewClusterFromURLsMap` over `--initial-cluster-token` +
+`--initial-cluster` (the identical computation etcd's bootstrap performs). This is
+authoritative for the founding members and drives the disk-wiped-restore probe. In
+`newRaftNode` — the single seam that carries the authoritative `cl.ID()` — the namespace
+is **rebound** to it and re-cached: a no-op for founding members, and the correction for
+a member that *joined* later (whose `--initial-cluster` describes the grown set, so the
+config reconstruction would hash the wrong set). Because a fresh joiner's restore probe
+is a no-op, the transient config-derived value it uses before the rebind is harmless.
+
+- **Clusters that share one bucket are isolated by cluster ID *and* data-dir root.**
+  Two clusters collide only if they share both (same founding member set, token, and
+  deployment root) *and* the same bucket/prefix — give one a distinct token,
+  initial-cluster, data-dir root, or bucket. A single cluster per bucket/prefix needs no
+  coordination.
 
 - **A joining member finds the log via the frozen cluster ID**, which it learns from
   the running cluster and has rebound in `newRaftNode` — independent of `--initial-cluster`

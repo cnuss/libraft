@@ -23,18 +23,22 @@ import (
 	"go.uber.org/zap"
 )
 
-func cfgWith(t *testing.T, token, cluster string) config.ServerConfig {
+// cfgWith builds a ServerConfig with a given cluster token, --initial-cluster,
+// and data dir (its parent is the namespace's isolation discriminator).
+func cfgWith(t *testing.T, token, cluster, dataDir string) config.ServerConfig {
 	t.Helper()
 	m, err := types.NewURLsMap(cluster)
 	if err != nil {
 		t.Fatalf("NewURLsMap(%q): %v", cluster, err)
 	}
-	return config.ServerConfig{InitialClusterToken: token, InitialPeerURLsMap: m}
+	return config.ServerConfig{InitialClusterToken: token, InitialPeerURLsMap: m, DataDir: dataDir}
 }
 
 const (
 	genesis = "m1=http://10.0.0.1:2380,m2=http://10.0.0.2:2380,m3=http://10.0.0.3:2380"
 	grown   = genesis + ",m4=http://10.0.0.4:2380"
+	dirA    = "/var/lib/etcd/member"
+	dirB    = "/tmp/TestFoo123/member"
 )
 
 // TestCidFromConfigMatchesEtcd proves cidFromConfig reproduces the exact cluster
@@ -42,7 +46,7 @@ const (
 // membership.NewClusterFromURLsMap path over identical inputs.
 func TestCidFromConfigMatchesEtcd(t *testing.T) {
 	lg := zap.NewNop()
-	cfg := cfgWith(t, "tok", genesis)
+	cfg := cfgWith(t, "tok", genesis, dirA)
 
 	want, err := membership.NewClusterFromURLsMap(lg, cfg.InitialClusterToken, cfg.InitialPeerURLsMap)
 	if err != nil {
@@ -53,33 +57,54 @@ func TestCidFromConfigMatchesEtcd(t *testing.T) {
 	}
 }
 
-// TestNsFromClusterIDFormat pins the namespace prefix format.
-func TestNsFromClusterIDFormat(t *testing.T) {
-	if got, want := nsFromClusterID(types.ID(0x1a2b)), "c-0000000000001a2b"; got != want {
-		t.Fatalf("nsFromClusterID = %q, want %q", got, want)
+// TestNsKeyFormat pins the namespace prefix format: a legible cluster ID plus a
+// hashed data-dir root.
+func TestNsKeyFormat(t *testing.T) {
+	got := nsKey("/var", types.ID(0x1a2b))
+	want := "c-0000000000001a2b-" // cluster ID stays legible; root is the hashed tail
+	if len(got) != len("c-")+16+1+16 || got[:len(want)] != want {
+		t.Fatalf("nsKey = %q, want prefix %q and hashed root tail", got, want)
 	}
 }
 
 // TestNsIdenticalAcrossMembers: every member of a cluster passes the same
-// --initial-cluster / token, so all derive the same namespace regardless of
-// which member's config is inspected.
+// --initial-cluster / token and shares a deployment root, so all derive the same
+// namespace regardless of which member's config is inspected.
 func TestNsIdenticalAcrossMembers(t *testing.T) {
 	lg := zap.NewNop()
-	a := nsFromConfig(lg, cfgWith(t, "tok", genesis))
-	b := nsFromConfig(lg, cfgWith(t, "tok", genesis))
+	a := nsFromConfig(lg, cfgWith(t, "tok", genesis, dirA+"/0"))
+	b := nsFromConfig(lg, cfgWith(t, "tok", genesis, dirA+"/1"))
 	if a != b {
 		t.Fatalf("namespace differs across members: %q vs %q", a, b)
 	}
 }
 
-// TestNsTokenDiscriminatesClusters: two clusters sharing member URLs but not the
-// cluster token get distinct namespaces (the token feeds each member ID hash).
+// TestNsTokenDiscriminatesClusters: two clusters sharing member URLs and root but
+// not the cluster token get distinct namespaces (the token feeds the cluster ID).
 func TestNsTokenDiscriminatesClusters(t *testing.T) {
 	lg := zap.NewNop()
-	a := nsFromConfig(lg, cfgWith(t, "tok-a", genesis))
-	b := nsFromConfig(lg, cfgWith(t, "tok-b", genesis))
+	a := nsFromConfig(lg, cfgWith(t, "tok-a", genesis, dirA))
+	b := nsFromConfig(lg, cfgWith(t, "tok-b", genesis, dirA))
 	if a == b {
 		t.Fatalf("distinct tokens collided on namespace %q", a)
+	}
+}
+
+// TestNsRootDiscriminatesClusters guards the regression that broke the e2e suite:
+// clusters sharing a token, member URLs, AND cluster ID (all the single-node
+// localhost:20001 / token "new" tests) must still be isolated by their data-dir
+// root, or they share one S3 log.
+func TestNsRootDiscriminatesClusters(t *testing.T) {
+	lg := zap.NewNop()
+	single := "m0=http://localhost:2380"
+	a := nsFromConfig(lg, cfgWith(t, "new", single, dirA))
+	b := nsFromConfig(lg, cfgWith(t, "new", single, dirB))
+	if a == b {
+		t.Fatalf("clusters with identical cluster ID but distinct roots collided on %q", a)
+	}
+	// Same cluster ID confirms the root is the ONLY discriminator here.
+	if cidFromConfig(lg, cfgWith(t, "new", single, dirA)) != cidFromConfig(lg, cfgWith(t, "new", single, dirB)) {
+		t.Fatal("expected identical cluster IDs; test no longer exercises the root discriminator")
 	}
 }
 
@@ -89,7 +114,7 @@ func TestNsTokenDiscriminatesClusters(t *testing.T) {
 // wrong log. newRaftNode corrects this from the authoritative cl.ID().
 func TestGrownSetShiftsCid(t *testing.T) {
 	lg := zap.NewNop()
-	if nsFromConfig(lg, cfgWith(t, "tok", genesis)) == nsFromConfig(lg, cfgWith(t, "tok", grown)) {
+	if nsFromConfig(lg, cfgWith(t, "tok", genesis, dirA)) == nsFromConfig(lg, cfgWith(t, "tok", grown, dirA)) {
 		t.Fatal("expected genesis and grown-set configs to derive different cluster IDs")
 	}
 }
@@ -98,9 +123,7 @@ func TestGrownSetShiftsCid(t *testing.T) {
 // derivation and is returned verbatim (whitespace-trimmed).
 func TestResolveNSEnvOverride(t *testing.T) {
 	t.Setenv(EnvNS, "  c-deadbeef  ")
-	cfg := cfgWith(t, "tok", genesis)
-	cfg.DataDir = t.TempDir()
-	if got := resolveNS(zap.NewNop(), cfg); got != "c-deadbeef" {
+	if got := resolveNS(zap.NewNop(), cfgWith(t, "tok", genesis, dirA)); got != "c-deadbeef" {
 		t.Fatalf("resolveNS with %s set = %q, want c-deadbeef", EnvNS, got)
 	}
 }
@@ -112,7 +135,7 @@ func TestCidFromConfigInvalidFallsBackToZero(t *testing.T) {
 	lg := zap.NewNop()
 	// Two members with identical peer URLs collapse to the same member ID.
 	dup := "m1=http://10.0.0.1:2380,m2=http://10.0.0.1:2380"
-	if got := cidFromConfig(lg, cfgWith(t, "tok", dup)); got != types.ID(0) {
+	if got := cidFromConfig(lg, cfgWith(t, "tok", dup, dirA)); got != types.ID(0) {
 		t.Fatalf("cidFromConfig on duplicate members = %s, want 0", got)
 	}
 }
