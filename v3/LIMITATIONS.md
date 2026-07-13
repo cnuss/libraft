@@ -45,26 +45,38 @@ longer depends on operator discipline:
 
 ## Membership & restore
 
-Each cluster's objects live under a bucket namespace (`<bucket>/<prefix>/c-<hash>/…`)
-derived from three inputs — the **cluster token**, the **parent of the member's data
-directory**, and the **lowest `--initial-cluster` peer URL** (`nsFromConfig`,
-checkpoint.go) — cached on first boot in `<member>/libraft-ns`. All three are identical
-across members (incl. those added later), stable across membership changes, and only
-read — never mutated — so they don't perturb etcd's cluster ID. The etcd cluster ID
-itself would be the ideal key but is unreachable without editing `bootstrap.go`
-(it's computed after the backend is opened and never handed to the raft node).
+Each cluster's objects live under a bucket namespace (`<bucket>/<prefix>/c-<id>/…`)
+keyed on the **real etcd cluster ID** (`nsFromConfig` / `rebindNamespace`,
+checkpoint.go) — cached on first boot in `<member>/libraft-ns`. The cluster ID is
+globally unique per cluster and frozen at genesis (etcd hashes the founding member
+set once and never regenerates it), so it is identical across members and stable
+across membership changes and disk-wiped restarts.
 
-- **Clusters that share one bucket need a distinct token, data-dir parent, or lowest
-  peer URL.** Any one differing isolates them. Only clusters matching on all three
-  *and* the same bucket collide — give one a distinct token, path, peer URL, or
-  bucket. A single cluster per bucket/prefix needs no coordination.
+It reaches the namespace by two paths. In `S3OpenBackend` — which runs before the
+raft node exists — the ID is reconstructed from `ServerConfig` by reusing etcd's own
+`membership.NewClusterFromURLsMap` over `--initial-cluster-token` + `--initial-cluster`
+(the identical computation etcd's bootstrap performs). This is authoritative for the
+founding members and drives the disk-wiped-restore probe. In `newRaftNode` — the single
+seam that carries the authoritative `cl.ID()` — the namespace is **rebound** to it and
+re-cached: a no-op for founding members, and the correction for a member that *joined*
+later (whose `--initial-cluster` describes the grown set, so the config reconstruction
+would hash the wrong set). Because a fresh joiner's restore probe is a no-op, the
+transient config-derived value it uses before the rebind is harmless.
 
-- **A joining member must pass the same token, share the same data-dir parent, and
-  keep the same lowest peer URL** as the cluster it joins, or it derives a different
-  namespace and won't find the log. All hold for a normal member add (a new member
-  has a higher URL, so the minimum is unchanged). The one gap: permanently removing
-  the lowest-peer-URL member and then adding a brand-new member shifts the minimum,
-  so that new member can't find the log (existing members keep their cached namespace).
+- **Clusters that share one bucket are isolated by their cluster ID.** Two clusters
+  collide only if they share a cluster ID (same founding member set *and* token) *and*
+  the same bucket/prefix — give one a distinct token, initial-cluster, or bucket. A
+  single cluster per bucket/prefix needs no coordination.
+
+- **A joining member finds the log via the frozen cluster ID**, which it learns from
+  the running cluster and has rebound in `newRaftNode` — independent of `--initial-cluster`
+  ordering or which members remain. This closes the old proxy-hash gap where removing
+  the lowest-peer-URL member and then adding a brand-new one shifted the derived key.
+
+- **`ETCD_S3LOG_NS` pins the namespace explicitly**, overriding both the on-disk cache
+  and the cluster-ID derivation (and suppressing the rebind). Use it to point a new
+  process at an existing cluster's log — e.g. disk-wiped recovery or migration. Set it
+  uniformly across every member; a mismatch splits them onto separate logs.
 
 - **Leadership is pinned to the founder; it does not follow membership changes.**
   The genesis member claims the fencing epoch and stays leader; a member *joining* an

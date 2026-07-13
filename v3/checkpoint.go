@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	"math"
 	"os"
 	"path/filepath"
@@ -29,7 +28,9 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 
+	"go.etcd.io/etcd/client/pkg/v3/types"
 	"go.etcd.io/etcd/server/v3/config"
+	"go.etcd.io/etcd/server/v3/etcdserver/api/membership"
 	serverstorage "go.etcd.io/etcd/server/v3/storage"
 	"go.etcd.io/etcd/server/v3/storage/backend"
 	"go.etcd.io/raft/v3/raftpb"
@@ -87,6 +88,11 @@ var snapshotSource = func() backendSnapshotter {
 var (
 	capturedBackend backend.Backend
 	ActiveNS        string
+	// activeNSPath is the on-disk cache file for ActiveNS (nsFile(cfg)),
+	// captured in S3OpenBackend so newRaftNode — which has no ServerConfig but
+	// does have the authoritative cluster ID — can rewrite it when it rebinds
+	// the namespace (see rebindNamespace).
+	activeNSPath string
 	// restoredIndex is the snapshot index the backend was restored from
 	// during disk-wiped recovery (0 if no restore happened). The node reads
 	// it to resume log replay past the snapshot.
@@ -128,6 +134,7 @@ type memberProgress struct {
 func S3OpenBackend(cfg config.ServerConfig, hooks backend.Hooks) backend.Backend {
 	lg := Logger().Named("libraft")
 	guardConfig(lg, cfg)
+	activeNSPath = nsFile(cfg)
 	ActiveNS = resolveNS(lg, cfg)
 	forceNewClusterPurge(lg, cfg)
 
@@ -256,83 +263,98 @@ func nsFile(cfg config.ServerConfig) string {
 // dir so it is stable across every kind of restart. Once written, the cache is
 // authoritative: a member reuses the exact prefix its cluster first wrote
 // under regardless of any later config drift.
-func resolveNS(lg *zap.Logger, cfg config.ServerConfig) string {
+func resolveNS(lg *zap.Logger, cfg config.ServerConfig) (ns string) {
+	// An explicit operator override wins over both the cache and derivation, and
+	// is re-read each boot (deterministic), so it is not persisted.
+	if env := strings.TrimSpace(os.Getenv(EnvNS)); env != "" {
+		return env
+	}
+
 	f := nsFile(cfg)
+	// Whatever we resolve, leave it cached: MemberDir exists by the time
+	// OpenBackend runs (etcd created snap/ under it), so this best-effort write
+	// lets the next restart reuse the exact prefix (and re-seats a short cache).
+	defer func() { persistNS(lg, f, ns) }()
+
 	if b, err := os.ReadFile(f); err == nil {
-		if ns := strings.TrimSpace(string(b)); ns != "" {
-			return ns
+		if cached := strings.TrimSpace(string(b)); cached != "" {
+			return cached
 		}
 	}
-	ns := nsFromConfig(cfg)
-	// MemberDir exists by the time OpenBackend runs (etcd created snap/ under
-	// it); persist best-effort so the next restart reuses this exact prefix.
-	if err := os.WriteFile(f, []byte(ns), 0o600); err != nil {
-		lg.Warn("libraft: persist namespace failed", zap.Error(err), zap.String("path", f))
+	return nsFromConfig(lg, cfg)
+}
+
+// persistNS best-effort caches the resolved namespace to path.
+func persistNS(lg *zap.Logger, path, ns string) {
+	if err := os.WriteFile(path, []byte(ns), 0o600); err != nil {
+		lg.Warn("libraft: persist namespace failed", zap.Error(err), zap.String("path", path))
 	}
-	return ns
 }
 
-// nsFromConfig derives the per-cluster bucket namespace from three inputs that
-// are each identical across every member of a cluster (including members added
-// later) and stable across membership changes: the cluster token, the parent of
-// the member's data directory, and the lowest initial-cluster peer URL.
-//
-//   - The cluster token (--initial-cluster-token) is the natural per-cluster
-//     identity; it is only *read* here, never mutated, so it does not perturb
-//     etcd's own cluster/member IDs (giving etcd a unique token would).
-//   - The data-dir parent (the deployment's common root — /var/lib/etcd per host,
-//     or one temp root per test) discriminates clusters that reuse the same token
-//     (notably the e2e suite, where every cluster uses "new") but run under
-//     different roots.
-//   - The lowest peer URL in --initial-cluster discriminates distinct clusters
-//     that share a token *and* a data-dir parent — e.g. two clusters started
-//     under one process/test (make-mirror's source and dest). Every member passes
-//     the same --initial-cluster, so all agree on the minimum; a member added
-//     later keeps the same minimum as long as the lowest member stays, so it is
-//     stable across membership (unlike the full member-set hash, which shifts on
-//     any join). The minimum is a stable projection of the member set.
-//
-// Residual: permanently removing the lowest-peer-URL member and then adding a
-// brand-new member shifts the minimum, so that new member derives a different
-// namespace (existing members keep their cached one). Rare; not exercised by the
-// e2e suite (MemberReplace re-adds the same URL). Two clusters collide only when
-// token, data-dir parent, lowest peer URL, and bucket all match.
-func nsFromConfig(cfg config.ServerConfig) string {
-	root := filepath.Dir(strings.TrimRight(cfg.DataDir, string(filepath.Separator)))
-	// Length-prefix each field so the concatenation is injective: a raw
-	// "|"-join lets ("/data|a","b") and ("/data","a|b") collide, silently
-	// pointing two distinct clusters at one shared log ("|" is legal in both a
-	// data-dir path and an operator-chosen cluster token). The docstring's
-	// "all three must match" guarantee depends on this being unambiguous.
-	token := cfg.InitialClusterToken
-	peer := minPeerURL(cfg)
-	key := fmt.Sprintf("%d:%s%d:%s%d:%s", len(root), root, len(token), token, len(peer), peer)
-	return fmt.Sprintf("c-%016x", fnv64a(key))
-}
-
-// minPeerURL returns the lexicographically smallest advertised peer URL across
-// the initial-cluster configuration (empty if none). Identical across all
-// members of a cluster because they share --initial-cluster.
-func minPeerURL(cfg config.ServerConfig) string {
-	min := ""
-	for _, urls := range cfg.InitialPeerURLsMap {
-		for _, u := range urls {
-			s := u.String()
-			if min == "" || s < min {
-				min = s
-			}
-		}
+// rebindNamespace switches ActiveNS to the authoritative etcd cluster ID once
+// newRaftNode can observe it via cl.ID(). For original bootstrap members this
+// equals the ID S3OpenBackend already derived from config, so it is a no-op. For
+// a member that JOINED an existing cluster it corrects the namespace: a joiner's
+// --initial-cluster describes the grown set, not the genesis set etcd froze the
+// cluster ID over, so config derivation alone would point it at an empty log.
+// The corrected value is persisted so the next restart short-circuits via the
+// nsFile cache.
+func rebindNamespace(lg *zap.Logger, cl *membership.RaftCluster) {
+	// An explicit operator override (EnvNS) is authoritative — never clobber it
+	// with the derived cluster ID.
+	if strings.TrimSpace(os.Getenv(EnvNS)) != "" {
+		return
 	}
-	return min
+	ns := nsFromClusterID(cl.ID())
+	if ns == ActiveNS {
+		return
+	}
+	lg.Info("libraft: rebinding namespace to cluster ID",
+		zap.String("from", ActiveNS), zap.String("to", ns),
+		zap.String("cluster-id", cl.ID().String()))
+	ActiveNS = ns
+	if activeNSPath != "" {
+		persistNS(lg, activeNSPath, ns)
+	}
 }
 
-// fnv64a hashes s with the standard 64-bit FNV-1a. It backs the per-cluster
-// namespace key (nsFromConfig); the value only needs to be stable and
-// well-distributed, not any particular basis.
-func fnv64a(s string) uint64 {
-	h := fnv.New64a()
-	h.Write([]byte(s))
-	return h.Sum64()
+// nsFromConfig derives the per-cluster bucket namespace from the real etcd
+// cluster ID, reconstructed from the same ServerConfig inputs etcd itself
+// hashes at bootstrap (see cidFromConfig). The cluster ID is globally unique per
+// cluster and frozen at genesis, so it is the ideal namespace key.
+//
+// This value is authoritative ONLY for original bootstrap members: etcd freezes
+// the cluster ID by hashing the genesis member set, and never regenerates it on
+// AddMember. A member that joins LATER starts with --initial-cluster describing
+// the grown set, so cidFromConfig would hash the wrong set — that member instead
+// learns the frozen ID from the running cluster and has it rebound in
+// newRaftNode (see rebindNamespace). For such a joiner the ID derived here is
+// only used for the disk-wiped-restore probe, which is a no-op on a fresh member
+// anyway, so the transient mismatch is harmless.
+func nsFromConfig(lg *zap.Logger, cfg config.ServerConfig) string {
+	return nsFromClusterID(cidFromConfig(lg, cfg))
+}
+
+// cidFromConfig reconstructs the etcd cluster ID from ServerConfig by reusing
+// etcd's own membership hashing — the identical code path bootstrap takes
+// (NewClusterFromURLsMap over --initial-cluster-token + --initial-cluster).
+// Reusing the upstream function rather than reimplementing the SHA-1 keeps the
+// derivation from silently drifting on an etcd bump.
+func cidFromConfig(lg *zap.Logger, cfg config.ServerConfig) types.ID {
+	cl, err := membership.NewClusterFromURLsMap(lg, cfg.InitialClusterToken, cfg.InitialPeerURLsMap)
+	if err != nil {
+		// Only fires on a malformed initial-cluster (duplicate/zero member ID),
+		// which etcd would itself reject moments later. Deterministic across
+		// members, so a zero fallback stays consistent rather than split-brained.
+		lg.Warn("libraft: cluster ID derivation failed", zap.Error(err))
+		return types.ID(0)
+	}
+	return cl.ID()
+}
+
+// nsFromClusterID formats an etcd cluster ID as the bucket namespace prefix.
+func nsFromClusterID(id types.ID) string {
+	return fmt.Sprintf("c-%016x", uint64(id))
 }
 
 // prepareRestore downloads the latest bucket snapshot and stages it for

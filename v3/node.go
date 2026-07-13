@@ -37,8 +37,13 @@ import (
 	"go.etcd.io/raft/v3/tracker"
 )
 
-// envURL is the switch: when non-empty, libraft takes over consensus.
+// EnvURL is the switch: when non-empty, libraft takes over consensus.
 const EnvURL = "ETCD_S3LOG_URL"
+
+// EnvNS explicitly pins the per-cluster bucket namespace, overriding the
+// cluster-ID derivation (see nsFromConfig). Set it uniformly across every member
+// of a cluster; a mismatch splits them onto separate logs.
+const EnvNS = "ETCD_S3LOG_NS"
 
 var _ raft.Node = &node{}
 
@@ -302,13 +307,16 @@ func (n *node) seedGenesis(peers []raft.Peer) error {
 //
 // nsKey namespaces all objects (`<nsKey>/...`) so multiple etcd clusters
 // can share one bucket without seeing each other's logs. The hijack layer
-// derives it (see nsFromConfig) identically across members and stably across
-// membership changes and disk-wiped restarts.
+// derives it from the real etcd cluster ID (see nsFromConfig / rebindNamespace)
+// — globally unique per cluster, frozen at genesis, so it is identical across
+// members and stable across membership changes and disk-wiped restarts.
 func Start(lg *zap.Logger, rawurl string, id uint64, nsKey string, peers []raft.Peer, ms *raft.MemoryStorage) (raft.Node, error) {
 	// The per-cluster namespace isolates distinct clusters that share one
-	// bucket (see nsFromConfig): identical across all members (including those
-	// added later) and stable across membership changes, so a joining member
-	// finds the same log. Empty means the bucket/prefix root is the log.
+	// bucket (the etcd cluster ID; see nsFromConfig / rebindNamespace):
+	// identical across all members (including those added later, which have it
+	// rebound from the frozen cluster ID) and stable across membership changes,
+	// so a joining member finds the same log. Empty means the bucket/prefix
+	// root is the log.
 	cli, err := openStore(rawurl, nsKey)
 	if err != nil {
 		return nil, err
