@@ -37,6 +37,11 @@ type store interface {
 
 	// Object primitives.
 	get(key string) ([]byte, error)
+	// getOnce is a best-effort single-attempt read (no retry budget), for hot
+	// polling where a slow/erroring object should yield quickly to the caller's
+	// own deadline rather than block on the full retry budget — see the
+	// propagation barrier's marker reads.
+	getOnce(key string) ([]byte, error)
 	put(key string, body []byte) error
 	del(key string) error
 	list(keyPrefix string) ([]string, error)

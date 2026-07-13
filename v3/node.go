@@ -16,6 +16,7 @@ package v3
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"math"
@@ -24,11 +25,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 
+	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
 	"go.etcd.io/raft/v3/tracker"
@@ -65,16 +68,17 @@ type node struct {
 	cli store
 	clk clock // wall-clock seam for the sync-debounce cooldown + CAS backoff
 
-	proposec  chan proposal
-	readc     chan []byte
-	confc     chan confReq
-	statusc   chan chan raft.Status
-	pokec     chan struct{}
-	advancec  chan struct{}
-	readyc    chan raft.Ready
-	transferc chan uint64 // shutdown leadership-transfer target (see TransferLeadership)
-	stopc     chan struct{}
-	done      chan struct{}
+	proposec     chan proposal
+	readc        chan []byte
+	confc        chan confReq
+	statusc      chan chan raft.Status
+	pokec        chan struct{}
+	advancec     chan struct{}
+	readyc       chan raft.Ready
+	barrierDonec chan uint64 // a confirmBarrier goroutine reports a released target here (see the propagation barrier in handleProposals)
+	transferc    chan uint64 // shutdown leadership-transfer target (see TransferLeadership)
+	stopc        chan struct{}
+	done         chan struct{}
 
 	// notifyCancel stops the log-change notifier goroutine (see notify.go) and,
 	// via bgCtx, aborts in-flight background S3 calls on shutdown.
@@ -82,13 +86,33 @@ type node struct {
 	bgCtx        context.Context
 
 	// state below is owned by run()
-	lastIndex      uint64          // last log index known committed in S3
-	stableIndex    uint64          // last index already in the local MemoryStorage/WAL
-	pendingEntries []*raftpb.Entry // to hand out via Ready.Entries (WAL append)
-	pendingCommit  []*raftpb.Entry // to hand out via Ready.CommittedEntries
-	pendingReads   []raft.ReadState
-	pendingSoft    *raft.SoftState   // leadership announcement for the next Ready
-	pendingMsgs    []*raftpb.Message // heartbeats to hand out via Ready.Messages
+	lastIndex        uint64          // last log index known committed in S3
+	stableIndex      uint64          // last index already in the local MemoryStorage/WAL
+	pendingAppliedTo uint64          // commit index of the outstanding Ready; -> applied on Advance
+	pendingEntries   []*raftpb.Entry // to hand out via Ready.Entries (WAL append)
+	pendingCommit    []*raftpb.Entry // to hand out via Ready.CommittedEntries
+	pendingReads     []raft.ReadState
+	pendingSoft      *raft.SoftState   // leadership announcement for the next Ready
+	pendingMsgs      []*raftpb.Message // heartbeats to hand out via Ready.Messages
+
+	// pendingBarriers holds the target index of each committed-but-not-yet-
+	// confirmed propagation barrier (member add / auth mutation). While any is
+	// present, the run loop withholds CommittedEntries at or above the lowest
+	// target from etcd — apply is what unblocks the client, so gating apply holds
+	// the caller until peers catch up. Entries *below* the lowest target keep
+	// flowing, so a node can still apply peers' concurrent proposals while its own
+	// barrier is pending — this is what breaks the all-nodes-barrier-at-once
+	// deadlock the old blocking barrier caused. Run-goroutine owned; a
+	// confirmBarrier goroutine reports releases via barrierDonec.
+	pendingBarriers map[uint64]struct{}
+
+	// applied is the highest log index etcd has finished applying on this node
+	// (advanced when run() observes Advance). Read off the run goroutine by the
+	// applied-marker publisher, so it is atomic. It is the value each node
+	// publishes to member/<id> and the quantity the propagation barrier waits on
+	// (see confirmBarrier): a peer's authStore/membership only reflects an
+	// entry once applied has passed it.
+	applied atomic.Uint64
 
 	// voters and maxTerm are written only on the run goroutine, but the
 	// checkpointer goroutine (runCheckpointer -> pruneProgress/uploadSnapshot)
@@ -157,7 +181,14 @@ type confReq struct {
 	resc chan *raftpb.ConfState
 }
 
-const pollInterval = time.Second
+// pollInterval is how often a follower re-reads the shared log tail when no
+// notifier wakes it sooner. It also sets the propagation barrier's confirmation
+// floor: a barrier clears once peers apply and re-publish their marker, and a
+// peer notices the new entry within one poll (real S3 -> SQS notify latency is
+// ~1s, so the poll, not the notifier, is the fast path). Kept short so an
+// auth-heavy workload confirms each barrier in ~one poll rather than ~one SQS
+// round-trip; the cost is a steady GET per interval per node on an idle cluster.
+const pollInterval = 250 * time.Millisecond
 
 // minSyncInterval caps how often the run loop performs a blocking log read in
 // response to notification wakeups, bounding notification-driven latency while
@@ -284,23 +315,25 @@ func Start(lg *zap.Logger, rawurl string, id uint64, nsKey string, peers []raft.
 	}
 
 	n := &node{
-		lg:          lg.Named("libraft"),
-		id:          id,
-		cli:         cli,
-		clk:         realClock{},
-		readResultC: make(chan readResult, 64),
-		proposec:    make(chan proposal),
-		readc:       make(chan []byte),
-		confc:       make(chan confReq),
-		statusc:     make(chan chan raft.Status),
-		pokec:       make(chan struct{}, 1),
-		advancec:    make(chan struct{}),
-		readyc:      make(chan raft.Ready),
-		transferc:   make(chan uint64),
-		stopc:       make(chan struct{}),
-		done:        make(chan struct{}),
-		voters:      make(map[uint64]struct{}),
-		ms:          ms,
+		lg:              lg.Named("libraft"),
+		id:              id,
+		cli:             cli,
+		clk:             realClock{},
+		readResultC:     make(chan readResult, 64),
+		proposec:        make(chan proposal),
+		readc:           make(chan []byte),
+		confc:           make(chan confReq),
+		statusc:         make(chan chan raft.Status),
+		pokec:           make(chan struct{}, 1),
+		advancec:        make(chan struct{}),
+		readyc:          make(chan raft.Ready),
+		barrierDonec:    make(chan uint64, 8),
+		transferc:       make(chan uint64),
+		stopc:           make(chan struct{}),
+		done:            make(chan struct{}),
+		voters:          make(map[uint64]struct{}),
+		pendingBarriers: make(map[uint64]struct{}),
+		ms:              ms,
 	}
 
 	// Local durable state: entries the WAL already holds. base is the
@@ -331,6 +364,14 @@ func Start(lg *zap.Logger, rawurl string, id uint64, nsKey string, peers []raft.
 		n.lg.Info("libraft: resuming replay past restored snapshot",
 			zap.Uint64("restored-index", restoredIndex))
 	}
+
+	// Seed applied at the durable floor (the snapshot/restore index). The WAL
+	// tail base+1..li is persisted but not yet re-applied this process, so this
+	// is a deliberate under-report: applied climbs to the true value as run()
+	// re-emits those entries and observes Advance. Under-reporting only ever
+	// makes a peer's barrier wait longer (safe); over-reporting could release it
+	// before this node actually applied the entry.
+	n.applied.Store(base)
 
 	// --force-new-cluster re-genesis. forceNewClusterPurge (checkpoint.go) has
 	// already wiped this cluster's shared log; etcd's own force-new surgery left
@@ -488,6 +529,7 @@ func Start(lg *zap.Logger, rawurl string, id uint64, nsKey string, peers []raft.
 	go n.poll()
 	go n.runCheckpointer()
 	go n.watchLog(notifyCtx)
+	go n.publishApplied(notifyCtx)
 	return n, nil
 }
 
@@ -854,8 +896,18 @@ func (n *node) run() {
 	for {
 		var out chan raft.Ready
 		var rd raft.Ready
-		if !awaitingAdvance && (n.bootSnap != nil || len(n.pendingEntries) > 0 || len(n.pendingCommit) > 0 || len(n.pendingReads) > 0 || n.pendingSoft != nil || len(n.pendingMsgs) > 0) {
-			rd = n.makeReady()
+		// A pending propagation barrier caps how far committed entries may be
+		// applied this Ready: everything at or above the lowest unconfirmed target
+		// is withheld (see pendingBarriers). Entries below it still flow. The
+		// common case (no barrier) skips the split entirely.
+		release := n.lastIndex
+		emitCommit, holdCommit := n.pendingCommit, []*raftpb.Entry(nil)
+		if len(n.pendingBarriers) > 0 {
+			release = n.releaseIndex()
+			emitCommit, holdCommit = splitCommit(n.pendingCommit, release)
+		}
+		if !awaitingAdvance && (n.bootSnap != nil || len(n.pendingEntries) > 0 || len(emitCommit) > 0 || len(n.pendingReads) > 0 || n.pendingSoft != nil || len(n.pendingMsgs) > 0) {
+			rd = n.makeReady(emitCommit, release)
 			out = n.readyc
 		}
 
@@ -894,16 +946,30 @@ func (n *node) run() {
 		case <-heartbeatTicker.C:
 			n.buildHeartbeats()
 		case out <- rd:
-			// hand out at most one Ready until the next Advance, like raft does
+			// hand out at most one Ready until the next Advance, like raft does.
+			// The committed entries in this Ready apply up to release (== lastIndex
+			// when no barrier is pending); record that so Advance (etcd finished
+			// applying them) can publish it. Entries withheld by a barrier stay in
+			// pendingCommit and flow once the barrier confirms.
+			n.pendingAppliedTo = release
 			n.bootSnap = nil
 			n.pendingSoft = nil
 			n.pendingEntries = nil
-			n.pendingCommit = nil
+			n.pendingCommit = holdCommit
 			n.pendingReads = nil
 			n.pendingMsgs = nil
 			awaitingAdvance = true
+		case idx := <-n.barrierDonec:
+			// A confirmBarrier goroutine reports its target confirmed (or timed
+			// out): drop the hold so its entries can be applied on the next Ready.
+			delete(n.pendingBarriers, idx)
 		case <-n.advancec:
 			awaitingAdvance = false
+			// etcd has applied the entries from the Ready just handed out; expose
+			// the new applied index to the marker publisher (monotonic).
+			if n.pendingAppliedTo > n.applied.Load() {
+				n.applied.Store(n.pendingAppliedTo)
+			}
 		case <-n.stopc:
 			return
 		}
@@ -921,11 +987,19 @@ func (n *node) hardState() *raftpb.HardState {
 	}
 }
 
-func (n *node) makeReady() raft.Ready {
+// makeReady builds the Ready to hand etcd. emitCommit is the barrier-gated slice
+// of committed entries to apply this round (== pendingCommit when no barrier is
+// pending); commit is the index they apply through, which caps HardState.Commit
+// so the persisted commit never runs ahead of what was actually applied.
+func (n *node) makeReady(emitCommit []*raftpb.Entry, commit uint64) raft.Ready {
+	hs := n.hardState()
+	if commit < hs.GetCommit() {
+		hs.Commit = proto.Uint64(commit)
+	}
 	rd := raft.Ready{
-		HardState:        n.hardState(),
+		HardState:        hs,
 		Entries:          n.pendingEntries,
-		CommittedEntries: n.pendingCommit,
+		CommittedEntries: emitCommit,
 		ReadStates:       n.pendingReads,
 		Messages:         n.pendingMsgs,
 		MustSync:         len(n.pendingEntries) > 0,
@@ -935,6 +1009,33 @@ func (n *node) makeReady() raft.Ready {
 		rd.Snapshot = n.bootSnap
 	}
 	return rd
+}
+
+// releaseIndex is the highest committed index the run loop may apply right now:
+// lastIndex normally, or one below the lowest pending propagation-barrier target
+// while any barrier is unconfirmed. Run-goroutine only.
+func (n *node) releaseIndex() uint64 {
+	hold := uint64(0)
+	for t := range n.pendingBarriers {
+		if hold == 0 || t < hold {
+			hold = t
+		}
+	}
+	if hold == 0 {
+		return n.lastIndex
+	}
+	return hold - 1
+}
+
+// splitCommit partitions committed entries (ascending by index) into those at or
+// below release (apply now) and those above (withheld by a barrier).
+func splitCommit(pc []*raftpb.Entry, release uint64) (emit, hold []*raftpb.Entry) {
+	for i, e := range pc {
+		if e.GetIndex() > release {
+			return pc[:i], pc[i:]
+		}
+	}
+	return pc, nil
 }
 
 // buildHeartbeats stages a no-op MsgHeartbeat to every peer (all known members
@@ -987,6 +1088,17 @@ func (n *node) voterSet() map[uint64]struct{} {
 	return m
 }
 
+// hasPeers reports whether the cluster currently has more than one voting
+// member, i.e. whether any *other* node exists that must pull a commit before a
+// client can observe it elsewhere. Used to gate the auth propagation barrier:
+// on a single-member cluster there is no peer to catch up, so the delay would
+// be pure dead time on every auth write.
+func (n *node) hasPeers() bool {
+	n.membMu.RLock()
+	defer n.membMu.RUnlock()
+	return len(n.voters) > 1
+}
+
 // sortedVotersLocked returns the voter member IDs sorted ascending. Caller must
 // hold membMu (RLock or Lock).
 func (n *node) sortedVotersLocked() []uint64 {
@@ -1027,19 +1139,49 @@ drain:
 		}
 	}
 	err := n.appendBatch(batch)
-	if err == nil && addsMember(batch) {
-		// Propagation barrier. A member add is committed the instant its log
+	// A member add always barriers (even a 1->2 add: the pre-add node is the
+	// peer the new member validates against). An auth mutation only barriers
+	// when a peer actually exists to catch up — otherwise a single-member
+	// cluster pays the delay on every user/role write for no one's benefit.
+	if err == nil && (addsMember(batch) || (n.hasPeers() && mutatesAuth(batch))) {
+		// Propagation barrier. A proposal is committed the instant its log
 		// object is CAS-written, but peers learn of it only by *pulling* the
 		// shared log (libraft sends no raft traffic), so an existing member can
-		// still be serving a membership view that predates this add. etcd's
-		// MemberAdd returns as soon as *this* node applies the ConfChange, and
-		// the caller immediately starts the new member, which validates its
-		// config against an existing peer's /members — if that peer has not yet
-		// pulled the add, bootstrap fails ("member count is unequal" /
-		// "could not retrieve cluster information"). Holding the ConfChange here
-		// (before run() emits it as a committed entry, which is what unblocks
-		// MemberAdd) gives every peer a full poll interval to catch up first.
-		n.clk.Sleep(memberChangePropagationDelay)
+		// still be serving state that predates this commit. Two cases need the
+		// caller held until peers catch up, both because the caller's *next*
+		// action targets a peer that must already have applied this entry:
+		//
+		//   - Member add: etcd's MemberAdd returns as soon as *this* node
+		//     applies the ConfChange, and the caller immediately starts the new
+		//     member, which validates its config against an existing peer's
+		//     /members — if that peer has not yet pulled the add, bootstrap
+		//     fails ("member count is unequal" / "could not retrieve cluster
+		//     information").
+		//   - Auth mutation: Authenticate assigns a token in each member's
+		//     local authStore only when that member applies the entry, so a
+		//     token handed back by this node is rejected ("invalid auth token")
+		//     by any peer that has not yet pulled it; auth enable/user/role
+		//     writes are the same shape.
+		//
+		// The caller is unblocked when etcd *applies* the committed entry, so we
+		// hold the caller by withholding that entry's apply (see pendingBarriers
+		// and releaseIndex) until peers confirm — NOT by blocking this run
+		// goroutine. Blocking here would also stall this node's apply of *peers'*
+		// concurrent proposals (syncTail runs on this loop), so when every node
+		// barriers at once none can satisfy the others and all wait out the
+		// deadline. Registering the hold and confirming off-loop lets the loop
+		// keep applying below the hold, so peers actually advance and confirm
+		// fast. A confirmBarrier goroutine polls peer markers and reports the
+		// release via barrierDonec.
+		//
+		// The hold covers the *whole* batch, so gate at its first index: a
+		// coalesced batch can carry several auth mutations, each unblocking a
+		// different caller when *its* entry applies, and every one must wait for
+		// peers. Confirmation still targets the last index — peers must have
+		// pulled through the batch end.
+		holdFrom := n.lastIndex - uint64(len(batch)) + 1
+		n.pendingBarriers[holdFrom] = struct{}{}
+		go n.confirmBarrier(holdFrom, n.lastIndex)
 	}
 	for _, p := range batch {
 		if p.resc != nil {
@@ -1048,11 +1190,129 @@ drain:
 	}
 }
 
-// memberChangePropagationDelay bounds how long a member add is held on the
-// serving node before MemberAdd returns, so peers pull the change first. It
-// exceeds pollInterval so a peer whose change-notification stream is degraded
-// still catches up via the poll fallback within the window.
-const memberChangePropagationDelay = pollInterval + 500*time.Millisecond
+// propagationDelay is the *ceiling* the propagation barrier waits for peers to
+// confirm they applied a member add / auth mutation (see confirmBarrier).
+// Confirmation normally returns far sooner; this bounds the wait when a peer is
+// down or unreachable, and it exceeds pollInterval so a peer that fell back to
+// polling still catches up within the window before the barrier gives up.
+const propagationDelay = pollInterval + 500*time.Millisecond
+
+// propagationCheckInterval paces the barrier's re-checks of peer applied
+// markers. Small relative to the store round-trip that dominates each check, so
+// confirmation is observed promptly without busy-spinning.
+const propagationCheckInterval = 25 * time.Millisecond
+
+// appliedMarkerInterval is how often the publisher rewrites this node's
+// member/<id> applied marker while its applied index is advancing. It bounds how
+// stale a peer's published applied can be, hence the barrier's confirmation
+// latency floor; kept well under propagationDelay so the common path is fast.
+const appliedMarkerInterval = 100 * time.Millisecond
+
+// appliedMarker is the body of a member/<id> object: the highest log index that
+// node has applied, plus a wall-clock stamp for operators inspecting the bucket
+// (the barrier itself keys only off Applied).
+type appliedMarker struct {
+	Applied uint64 `json:"applied"`
+	UnixNs  int64  `json:"ts"`
+}
+
+// memberKey is the object key under which a node publishes its applied marker.
+func memberKey(id uint64) string { return "member/" + strconv.FormatUint(id, 16) }
+
+// publishApplied writes this node's applied index to member/<id> whenever it
+// advances, so peers' propagation barriers can confirm this node has caught up.
+// Runs off the run goroutine (reads applied atomically); writes only on change,
+// so an idle node makes no store traffic.
+func (n *node) publishApplied(ctx context.Context) {
+	t := time.NewTicker(appliedMarkerInterval)
+	defer t.Stop()
+	var last uint64
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			// No peers -> no one reads this marker (the barrier is skipped on a
+			// single-member cluster), so skip the write entirely. This also keeps
+			// a busy single node (e.g. a stress test hammering the log) from
+			// spending store writes on markers nobody consumes.
+			if !n.hasPeers() {
+				continue
+			}
+			a := n.applied.Load()
+			if a == last {
+				continue
+			}
+			body, err := json.Marshal(appliedMarker{Applied: a, UnixNs: n.clk.Now().UnixNano()})
+			if err != nil {
+				continue
+			}
+			if n.cli.put(memberKey(n.id), body) == nil {
+				last = a
+			}
+		}
+	}
+}
+
+// confirmBarrier runs off the run goroutine. It waits until every peer has
+// published an applied marker >= target (the win: peers apply and re-publish in
+// ~ms with a live notifier), or propagationDelay elapses (the safety fallback
+// for a down/unreachable peer), then reports hold back to run() via barrierDonec
+// so the loop clears the pendingBarriers key and lifts the apply gate. Running
+// off-loop is essential: the run loop must stay free to apply peers' concurrent
+// proposals while this barrier is pending, or concurrent barriers on every node
+// deadlock each other. hold and target differ only for a coalesced multi-entry
+// batch — gate its first index, confirm its last.
+func (n *node) confirmBarrier(hold, target uint64) {
+	deadline := n.clk.Now().Add(propagationDelay)
+	for !n.peersAppliedAtLeast(target) {
+		if !n.clk.Now().Before(deadline) {
+			break // safety fallback: a down/unreachable peer never confirms
+		}
+		select {
+		case <-n.stopc:
+			return
+		default:
+		}
+		n.clk.Sleep(propagationCheckInterval)
+	}
+	select {
+	case n.barrierDonec <- hold:
+	case <-n.stopc:
+	}
+}
+
+// peersAppliedAtLeast reports whether every voter other than this node has a
+// published applied marker at or beyond target. A missing/unreadable/behind
+// marker yields false (not yet confirmed) — the caller retries until the
+// deadline. Reads voters under membMu; issues one store GET per peer.
+func (n *node) peersAppliedAtLeast(target uint64) bool {
+	for _, id := range n.otherVoters() {
+		body, err := n.cli.getOnce(memberKey(id))
+		if err != nil {
+			return false
+		}
+		var m appliedMarker
+		if json.Unmarshal(body, &m) != nil || m.Applied < target {
+			return false
+		}
+	}
+	return true
+}
+
+// otherVoters returns the current voter IDs excluding this node, sorted.
+func (n *node) otherVoters() []uint64 {
+	n.membMu.RLock()
+	defer n.membMu.RUnlock()
+	ids := make([]uint64, 0, len(n.voters))
+	for id := range n.voters {
+		if id != n.id {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	return ids
+}
 
 // addsMember reports whether the batch contains a ConfChange that adds a member
 // (voter or learner) — the case that a freshly started member's bootstrap must
@@ -1077,6 +1337,35 @@ func addsMember(batch []proposal) bool {
 					}
 				}
 			}
+		}
+	}
+	return false
+}
+
+// mutatesAuth reports whether the batch contains a normal proposal that changes
+// auth state (enable/disable, authenticate, or a user/role write). Each such
+// entry only takes effect on a member once that member applies it, so the
+// caller must be held until peers catch up (see the propagation barrier in
+// handleProposals) — most acutely for Authenticate, whose freshly issued token
+// is otherwise rejected as "invalid auth token" by any peer that has not yet
+// pulled it. Read-only auth requests (status/get/list) are deliberately
+// excluded: they mutate nothing, so no peer has to catch up.
+func mutatesAuth(batch []proposal) bool {
+	for _, p := range batch {
+		if p.typ != raftpb.EntryNormal || len(p.data) == 0 {
+			continue
+		}
+		var r pb.InternalRaftRequest
+		if proto.Unmarshal(p.data, &r) != nil {
+			continue
+		}
+		switch {
+		case r.AuthEnable != nil, r.AuthDisable != nil, r.Authenticate != nil,
+			r.AuthUserAdd != nil, r.AuthUserDelete != nil, r.AuthUserChangePassword != nil,
+			r.AuthUserGrantRole != nil, r.AuthUserRevokeRole != nil,
+			r.AuthRoleAdd != nil, r.AuthRoleDelete != nil,
+			r.AuthRoleGrantPermission != nil, r.AuthRoleRevokePermission != nil:
+			return true
 		}
 	}
 	return false
@@ -1154,6 +1443,15 @@ const (
 // read is still in flight (tailInFlight) — re-arms a single deferred poke so no
 // change is missed. Owned by run().
 func (n *node) syncTail() {
+	// A single-member cluster is the sole author of its log, so its tail is
+	// always current — every sync would read back only what it just wrote.
+	// Skip them: otherwise a change notifier (e.g. SQS) fires a blocking read
+	// on the run loop for each of this node's own appends, competing with the
+	// write path and roughly halving throughput under a write-heavy load.
+	// (Run-goroutine reads of voters are lockless; see membMu.)
+	if len(n.voters) <= 1 {
+		return
+	}
 	if d := n.clk.Since(n.lastSync); d < minSyncInterval {
 		if !n.resyncArmed {
 			n.resyncArmed = true
