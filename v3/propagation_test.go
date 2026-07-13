@@ -109,6 +109,89 @@ func TestMutatesAuth(t *testing.T) {
 	}
 }
 
+func entries(indices ...uint64) []*raftpb.Entry {
+	es := make([]*raftpb.Entry, len(indices))
+	for i, idx := range indices {
+		es[i] = &raftpb.Entry{Index: proto.Uint64(idx)}
+	}
+	return es
+}
+
+func indicesOf(es []*raftpb.Entry) []uint64 {
+	out := make([]uint64, len(es))
+	for i, e := range es {
+		out[i] = e.GetIndex()
+	}
+	return out
+}
+
+func TestSplitCommit(t *testing.T) {
+	tests := []struct {
+		name       string
+		pc         []uint64
+		release    uint64
+		emit, hold []uint64
+	}{
+		{"empty", nil, 5, nil, nil},
+		{"all below release", []uint64{1, 2, 3}, 5, []uint64{1, 2, 3}, nil},
+		{"all held", []uint64{6, 7, 8}, 5, nil, []uint64{6, 7, 8}},
+		{"split", []uint64{3, 4, 5, 6, 7}, 5, []uint64{3, 4, 5}, []uint64{6, 7}},
+		{"release below all holds everything", []uint64{2, 3}, 1, nil, []uint64{2, 3}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			emit, hold := splitCommit(entries(tc.pc...), tc.release)
+			if got := indicesOf(emit); !slicesEqual(got, tc.emit) {
+				t.Errorf("emit = %v, want %v", got, tc.emit)
+			}
+			if got := indicesOf(hold); !slicesEqual(got, tc.hold) {
+				t.Errorf("hold = %v, want %v", got, tc.hold)
+			}
+		})
+	}
+}
+
+func slicesEqual(a, b []uint64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestReleaseIndex(t *testing.T) {
+	n := &node{lastIndex: 42, pendingBarriers: map[uint64]struct{}{}}
+
+	// No pending barrier: apply is free up to lastIndex.
+	if got := n.releaseIndex(); got != 42 {
+		t.Fatalf("no barrier: releaseIndex = %d, want 42", got)
+	}
+	// One barrier at 20: withhold 20 and above.
+	n.pendingBarriers[20] = struct{}{}
+	if got := n.releaseIndex(); got != 19 {
+		t.Fatalf("one barrier: releaseIndex = %d, want 19", got)
+	}
+	// A second, higher barrier does not lower the ceiling — the lowest gates.
+	n.pendingBarriers[25] = struct{}{}
+	if got := n.releaseIndex(); got != 19 {
+		t.Fatalf("two barriers: releaseIndex = %d, want 19 (lowest gates)", got)
+	}
+	// Once the lowest confirms, the next barrier gates.
+	delete(n.pendingBarriers, 20)
+	if got := n.releaseIndex(); got != 24 {
+		t.Fatalf("after lowest released: releaseIndex = %d, want 24", got)
+	}
+	// All confirmed: back to lastIndex.
+	delete(n.pendingBarriers, 25)
+	if got := n.releaseIndex(); got != 42 {
+		t.Fatalf("all released: releaseIndex = %d, want 42", got)
+	}
+}
+
 // writeMarker publishes an applied marker for id into the store, as
 // publishApplied would.
 func writeMarker(t *testing.T, ms *memStore, id, applied uint64) {
@@ -127,7 +210,7 @@ func newBarrierNode(id uint64, ms *memStore, clk clock, voters ...uint64) *node 
 	for _, v := range voters {
 		vs[v] = struct{}{}
 	}
-	return &node{id: id, cli: ms, lg: zap.NewNop(), voters: vs, clk: clk}
+	return &node{id: id, cli: ms, lg: zap.NewNop(), voters: vs, clk: clk, barrierDonec: make(chan uint64, 1)}
 }
 
 func TestPeersAppliedAtLeast(t *testing.T) {
@@ -163,19 +246,28 @@ func TestPeersAppliedAtLeastSingleMember(t *testing.T) {
 	}
 }
 
-func TestAwaitPropagationConfirmsWithoutWaiting(t *testing.T) {
+func TestConfirmBarrierConfirmsWithoutWaiting(t *testing.T) {
 	ms := newMemStore()
 	fc := &fakeClock{now: time.Unix(0, 0)}
 	n := newBarrierNode(1, ms, fc, 1, 2)
 	writeMarker(t, ms, 2, 100)
 
-	n.awaitPropagation(100) // peer already caught up
+	n.confirmBarrier(100, 100) // peer already caught up
 	if len(fc.slept) != 0 {
 		t.Fatalf("confirmed immediately: want 0 sleeps, got %v", fc.slept)
 	}
+	// It reports the released target back to run() via barrierDonec.
+	select {
+	case got := <-n.barrierDonec:
+		if got != 100 {
+			t.Fatalf("barrierDonec = %d, want 100", got)
+		}
+	default:
+		t.Fatal("confirmBarrier did not report the target on barrierDonec")
+	}
 }
 
-func TestAwaitPropagationFallsBackToDeadline(t *testing.T) {
+func TestConfirmBarrierFallsBackToDeadline(t *testing.T) {
 	ms := newMemStore()
 	fc := &fakeClock{now: time.Unix(0, 0)}
 	n := newBarrierNode(1, ms, fc, 1, 2)
@@ -183,7 +275,7 @@ func TestAwaitPropagationFallsBackToDeadline(t *testing.T) {
 	// barrier must give up at the deadline rather than block forever.
 	writeMarker(t, ms, 2, 5)
 
-	n.awaitPropagation(100)
+	n.confirmBarrier(100, 100)
 
 	var total time.Duration
 	for _, d := range fc.slept {
@@ -195,5 +287,15 @@ func TestAwaitPropagationFallsBackToDeadline(t *testing.T) {
 	// And it must stop near the deadline, not spin far past it.
 	if total > propagationDelay+propagationCheckInterval {
 		t.Fatalf("overran the deadline: waited %v (ceiling %v)", total, propagationDelay)
+	}
+	// Even on the deadline path it must release the hold, or run() would gate
+	// this target's apply forever.
+	select {
+	case got := <-n.barrierDonec:
+		if got != 100 {
+			t.Fatalf("barrierDonec = %d, want 100", got)
+		}
+	default:
+		t.Fatal("confirmBarrier did not report the target on barrierDonec after deadline")
 	}
 }
