@@ -102,11 +102,13 @@ func NewRaftNode(bp, ssp, walp, clp unsafe.Pointer) unsafe.Pointer {
 	// manufacturing a fresh one per call via Logger(); Start re-names it "libraft".
 	lg := b.lg.Named("libraft")
 
-	// The etcd cluster ID, unavailable to the StartNode seam. Logged for now; a
-	// productionized version would thread it into ActiveNS as the namespace key.
-	lg.Info("libraft: newRaftNode has cluster ID",
-		zap.String("cluster-id", cl.ID().String()),
-		zap.String("active-ns", ActiveNS))
+	// This seam — unlike the raft.StartNode seam that S3OpenBackend runs before —
+	// carries the authoritative etcd cluster ID (cl.ID()). Bind the namespace to
+	// it now: a no-op for original bootstrap members (S3OpenBackend already
+	// derived the same ID from config), but a correction for a member that JOINED
+	// an existing cluster, whose --initial-cluster describes the grown set rather
+	// than the genesis set etcd froze the cluster ID over (see rebindNamespace).
+	rebindNamespace(lg, cl)
 
 	// Deviation from etcd's own newRaftNode: it also stores the returned node in
 	// the package-level etcdserver.raftStatus indirection that backs the
