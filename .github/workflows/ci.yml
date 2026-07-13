@@ -244,37 +244,21 @@ jobs:
           ref: ${{ env.ETCD_REF }}
           path: etcd
 
-      # NOTE: hijacked modes run under etcd's stock ctl-test wrapper timeout
-      # (getTestTimeout() = 2*dialTimeout + 1s = 15s at the stock 7s dialTimeout).
-      # An earlier revision bumped dialTimeout to buy headroom for the auth
-      # propagation barrier; that is no longer needed. The barrier is now
-      # asynchronous (v3/node.go: confirmBarrier + the pendingBarriers apply gate),
-      # so concurrent auth mutations across members no longer serialize on the
-      # per-op deadline — TestCtlV3AuthEndpointHealth confirms in ~0.4s/op and
-      # finishes comfortably under 15s against real S3.
-
-      - name: raise etcd framework command-timeout for real-S3 latency (reflect-aws only)
-        if: matrix.mode == 'reflect-aws'
-        working-directory: etcd
-        # EtcdctlV3.spawnJSONCmd runs etcdctl with no --command-timeout, so
-        # etcdctl's built-in 5s governs each op. TestCtlV3AuthCertCNWithWithConcurrentOperation
-        # drives two goroutines hammering the shared log on a single node; under
-        # real-S3 CAS contention an op can spike past 5s, error, and t.Fatalf —
-        # which orphans the sibling's in-flight etcdctl child, whose expect.Close()
-        # (a bare wg.Wait, no kill) then blocks and leaks a goroutine that cascades
-        # t.Skip through every later auth test. Give flags() a default
-        # command-timeout so ops ride out contention spikes; per-op o.Timeout
-        # overrides still win (cmdArgs appends them after flags()). This is a
-        # genuine real-S3 write-latency accommodation, unrelated to the (now
-        # confirmation-based, no longer fixed-sleep) propagation barrier.
-        run: |
-          set -euo pipefail
-          g=tests/framework/e2e/etcdctl.go
-          grep -q 'fmap\["endpoints"\] = strings.Join(ctl.endpoints, ",")' "$g" \
-            || { echo "etcdctl flags() endpoints anchor not found in $g — etcd $ETCD_REF changed it; update this patch"; exit 1; }
-          perl -0777 -i -pe 's/(fmap\["endpoints"\] = strings\.Join\(ctl\.endpoints, ","\))/$1\n\tfmap["command-timeout"] = "60s"/' "$g"
-          grep -q 'fmap\["command-timeout"\] = "60s"' "$g" || { echo "etcdctl command-timeout patch did not apply"; exit 1; }
-          echo "patched $g: default etcdctl --command-timeout=60s"
+      # NOTE: hijacked modes run under etcd's stock ctl-test framework timeouts —
+      # no per-test patching. Two accommodations that earlier revisions carried
+      # here are gone:
+      #   - the ctl-test wrapper timeout (getTestTimeout() = 2*dialTimeout + 1s =
+      #     15s): the propagation barrier is now asynchronous (v3/node.go:
+      #     confirmBarrier + the pendingBarriers apply gate), so concurrent auth
+      #     mutations no longer serialize on the per-op deadline —
+      #     TestCtlV3AuthEndpointHealth confirms in ~0.4s/op, comfortably under 15s.
+      #   - a default etcdctl --command-timeout of 60s (was meant to keep
+      #     TestCtlV3AuthCertCNWithWithConcurrentOperation's single-node op storm
+      #     from spiking past etcdctl's stock 5s): with the single-member syncTail
+      #     gate (a lone writer no longer re-reads its own appends) that test runs
+      #     ~29s against real S3 with zero ops anywhere near 5s, well inside its own
+      #     40s deadline. The 60s bump only touched the per-op timeout, never that
+      #     total deadline, so it was addressing a failure mode that does not occur.
 
       - name: setup go
         uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
