@@ -62,7 +62,7 @@ jobs:
         # branching for $(...) / [ -n ... ] / piping.
         shell: bash
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: resolve go version
         id: goversion
@@ -77,7 +77,7 @@ jobs:
             echo "version=${{ matrix.go }}" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ steps.goversion.outputs.version }}
           cache: true
@@ -152,7 +152,7 @@ jobs:
       etcd-e2e: ${{ steps.filter.outputs.run }}
       modes: ${{ steps.modes.outputs.modes }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -233,12 +233,12 @@ jobs:
         mode: ${{ fromJSON(needs.changes.outputs.modes) }}
     steps:
       - name: checkout libraft
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: libraft
 
       - name: checkout etcd ${{ env.ETCD_REF }}
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: etcd-io/etcd
           ref: ${{ env.ETCD_REF }}
@@ -261,7 +261,7 @@ jobs:
       #     total deadline, so it was addressing a failure mode that does not occur.
 
       - name: setup go
-        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: etcd/go.mod
 
@@ -500,7 +500,7 @@ jobs:
 
       - name: upload logs
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-${{ matrix.mode }}-logs
           path: |
@@ -529,7 +529,7 @@ jobs:
       contents: write   # push tag + create release
       id-token: write   # cosign keyless signing via OIDC
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
